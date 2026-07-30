@@ -167,14 +167,26 @@ FORCED_MAP = {
     'pacteraedge': 'eventraaedge',
 }
 
-# ── manually curated company overrides ───────────────────────────────────────────────────────
-# Add real company names here as you identify ones that need a forced, pinned fake -- e.g. a
-# company missing from mapping_xref's CompanyName rows, an abbreviation/misspelling variant not
-# caught by the literal-match pass, or a case where you want to override whatever fake
-# mapping_xref currently has for it. Keys are matched case-insensitively and by whole
-# word/phrase (same engine as FORCED_MAP/apply_literal_map). These are merged OVER the
-# mapping_xref-derived map at runtime (see load_company_forced_map() in obi_anonymizer.py) --
-# entries here always win on conflict.
+# ── manually curated company overrides (fix D's ONLY input -- see below) ────────────────────
+# Add real company names here as you identify ones you want a guaranteed, deterministic fake
+# for in free text (dyncrm_activity/dyncrm_leads/etc.), regardless of what GLiNER detects.
+# Same reliability contract as FORCED_MAP above (Centific -> Aventraa): once a company is
+# listed here, it ALWAYS gets faked to the value you give it, every time, everywhere in
+# free text. Kept as a SEPARATE dict from FORCED_MAP (not merged into it) because FORCED_MAP's
+# matching has NO word-boundary check by design -- safe only for distinctive made-up tokens
+# like 'centific' that never collide with real words. A short/common company name (meta,
+# apple, dell) WOULD collide with ordinary words and even HTML tag names (confirmed: 'meta'
+# matched inside the literal `<meta http-equiv=...>` tag the first time this was tried) --
+# entries here go through apply_literal_map()'s word-boundary + HTML-tag-safety guard instead.
+#
+# EARLIER VERSION of this dict was auto-populated from EVERY mapping_xref CompanyName row
+# (93,695 of them) at runtime. Rolled back per explicit decision: that made the deterministic
+# regex used to apply it recompile from a ~93K-way alternation on every single free-text cell
+# (no caching), which turned a ~94min anonymization run into 3+ hours. This dict is now the
+# ONLY source for the company backstop -- keep it to the specific companies you already know
+# matter for a given slice; anything not listed here still gets normal GLiNER detection +
+# the engine's existing (fast, per-value) mapping_xref reuse-first lookup, just without this
+# extra deterministic guarantee.
 MANUAL_COMPANY_MAP = {
     # 'ibm': 'Some Fixed Fake',
 }
