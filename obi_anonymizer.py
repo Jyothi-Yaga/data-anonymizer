@@ -2243,12 +2243,8 @@ def run(cur, tbl, limit, restart, order_override, gl, prefer_clean=False, dry_ru
     # and_forced_company_map.md. `domain` gates KNOWN_BRAND_STOP in scrub_post; the company
     # forced-map is the deterministic backstop applied on top of GLiNER regardless of domain.
     domain = table_domain(base)
-    company_forced_map = {}
-    if have_freetext:
-        try:
-            _mc = connect_map(); company_forced_map = load_company_forced_map(_mc); _mc.close()
-        except Exception as e:
-            log(f"  (warn: company forced-map load failed: {str(e)[:80]})")
+    company_forced_map = load_company_forced_map() if have_freetext else {}
+    company_pattern_cache = {}   # compiled once, reused across every cell (see apply_literal_map)
     for c in enabled:                          # 'region' columns: build the real region pool
         if c.get('type') == 'region' and c.get('country_column'):
             engine.load_region_pool(cur, SCHEMA, tbl, c['column'], c['country_column'])
@@ -2588,8 +2584,8 @@ def run(cur, tbl, limit, restart, order_override, gl, prefer_clean=False, dry_ru
 
                 # STAGE 3: apply stage-2 entities as LITERAL substitutions (never offset splicing
                 # -- stripped text has different offsets than `v`, see apply_literal_map), then
-                # the mapping_xref-backed company forced-map (fix D) as a final deterministic
-                # backstop regardless of what GLiNER did or missed.
+                # the MANUAL_COMPANY_MAP backstop (fix D) as a final deterministic safety net
+                # for specific companies you've curated, regardless of what GLiNER did or missed.
                 for k in keys:
                     ri, ci = k
                     engine.set_log_context(insert_cols[ci])   # per-cell col context for stage-2 spans
@@ -2606,7 +2602,7 @@ def run(cur, tbl, limit, restart, order_override, gl, prefer_clean=False, dry_ru
                             lit_map[low] = engine.fake(span, t)
                         v = apply_literal_map(v, lit_map, protect)
                     if company_forced_map:
-                        v = apply_literal_map(v, company_forced_map, protect)
+                        v = apply_literal_map(v, company_forced_map, protect, pattern_cache=company_pattern_cache)
                     v = _json_safe_fallback(rows[ri][ci], v, pre)
                     pre_cache[k].append(v)   # index 3 = final scrubbed value
             out = []
@@ -3160,11 +3156,11 @@ def strip_html_for_detection(text):
 
 _LITERAL_WORD_BOUND = r'(?<![A-Za-z0-9])({})(?![A-Za-z0-9])'
 
-def apply_literal_map(text, literal_map, protect, min_len=3):
+def apply_literal_map(text, literal_map, protect, min_len=3, pattern_cache=None):
     """Deterministic, word/phrase-boundary-aware, longest-match-first literal substitution --
-    the mechanism behind BOTH the mapping_xref-backed company forced-map (fix D) and the
-    secondary HTML-stripped-pass entities (fix A). Unlike scrub_post's GLiNER-offset splicing,
-    this operates on literal STRING content, so it's safe to apply against a DIFFERENT (but
+    the mechanism behind BOTH the MANUAL_COMPANY_MAP backstop (fix D) and the secondary
+    HTML-stripped-pass entities (fix A). Unlike scrub_post's GLiNER-offset splicing, this
+    operates on literal STRING content, so it's safe to apply against a DIFFERENT (but
     string-identical-where-unmodified) text than whatever produced `literal_map`'s keys --
     exactly what's needed when detection ran on a stripped copy but the substitution must land
     in the original HTML-intact text.
@@ -3172,6 +3168,18 @@ def apply_literal_map(text, literal_map, protect, min_len=3):
     `literal_map`: {lowercased original -> fake}. `protect`: casefolded fakes already inserted
     this cell (never re-fake a fake). `min_len`: skip too-short keys (avoids single-letter/very
     common short-token noise from ever reaching this deterministic path).
+
+    `pattern_cache`: optional mutable dict the CALLER keeps alive across cells (e.g. one per
+    run()/scrub_text call site), used to avoid recompiling the same regex per cell. PERFORMANCE
+    INCIDENT: the original company backstop queried mapping_xref directly (93,695 CompanyName
+    rows) and this function recompiled a ~93K-way regex from scratch on EVERY cell (no cache at
+    all) -- that alone turned a ~94min run into 3+ hours. Rolled back to a small, manually
+    curated MANUAL_COMPANY_MAP (see load_company_forced_map), but ALSO fixed the underlying
+    bug here: pass a stable dict and this now compiles once and reuses it, keyed by the
+    literal_map object's identity (safe because the caller-owned cache and the map it's built
+    from share the same lifetime -- a stage-2 per-cell entity map is a fresh dict each call, so
+    it simply never hits the cache and compiles fresh each time, which is fine since those maps
+    are always tiny).
 
     CRITICAL guard: never substitute inside an HTML tag (`<meta ...>`, `<div class="...">`,
     etc.) -- confirmed by direct testing that a real company literally named "Meta" corrupted
@@ -3183,10 +3191,19 @@ def apply_literal_map(text, literal_map, protect, min_len=3):
     email/link passes already, not this literal sweep -- this sweep is prose-only."""
     if not text or not literal_map:
         return text
-    keys = sorted((k for k in literal_map if len(k) >= min_len), key=len, reverse=True)
-    if not keys:
-        return text
-    pattern = re.compile(_LITERAL_WORD_BOUND.format('|'.join(re.escape(k) for k in keys)), re.I)
+    if pattern_cache is not None and pattern_cache.get('map_id') == id(literal_map):
+        pattern = pattern_cache['pattern']
+        if pattern is None:                 # cached "no usable keys" result
+            return text
+    else:
+        keys = sorted((k for k in literal_map if len(k) >= min_len), key=len, reverse=True)
+        pattern = (re.compile(_LITERAL_WORD_BOUND.format('|'.join(re.escape(k) for k in keys)), re.I)
+                   if keys else None)
+        if pattern_cache is not None:
+            pattern_cache['map_id'] = id(literal_map)
+            pattern_cache['pattern'] = pattern
+        if pattern is None:
+            return text
     tag_spans = [(m.start(), m.end()) for m in _HTML_TAG_RE.finditer(text)] if '<' in text else []
 
     def _in_tag(s, e):
@@ -3208,34 +3225,30 @@ def apply_literal_map(text, literal_map, protect, min_len=3):
 
 
 _company_forced_map_cache = None
+_scrub_text_company_pattern_cache = {}   # compiled once, reused across scrub_text() calls
 
-def load_company_forced_map(map_conn):
-    """Build the deterministic company backstop (fix D): pull every real, already-canonicalized
-    company fake straight from the shared mapping table (mapping_xref/mapping_slice, whichever
-    XREF resolved to for this run's --version) so a literal substitution always fires even when
-    GLiNER misses or (in resume-domain tables) intentionally suppresses the entity -- reuses the
-    EXISTING fake, never invents a new one, so it stays consistent with every other table that's
-    already anonymized that same company. Merges constants.MANUAL_COMPANY_MAP on top for
-    hand-curated overrides/additions (always wins on conflict). Cached for the life of the
-    process -- the map doesn't change mid-run."""
+def load_company_forced_map():
+    """Build the deterministic company backstop (fix D) from constants.MANUAL_COMPANY_MAP only.
+
+    EARLIER VERSION queried every mapping_xref CompanyName row (93,695 of them) and rebuilt a
+    regex alternation from all of them on every single freetext cell -- with apply_literal_map
+    recompiling that ~93K-way regex from scratch per call (not cached), this turned a ~94min
+    run into a 3+ hour one. Rolled back per explicit decision: rely on the ALREADY-fast normal
+    path instead (GLiNER detection + engine.fake()'s existing per-value reuse-first lookup
+    against mapping_xref, which is a plain dict lookup, not a bulk regex scan) for anything not
+    manually listed here. MANUAL_COMPANY_MAP is for a small, deliberately-curated set of
+    companies you already know appear in this data and want a guaranteed, deterministic
+    backstop for regardless of what GLiNER detects -- same reliability contract as FORCED_MAP
+    (Centific/Pactera), just kept as its own dict (not merged into FORCED_MAP/apply_forced)
+    because that mechanism has NO word-boundary check by design (safe only for distinctive
+    made-up tokens like 'centific' that never collide with real words) -- 'meta'/'apple'/'dell'
+    style entries need the word-boundary + HTML-tag-safety guard apply_literal_map provides.
+    Cached for the life of the process."""
     global _company_forced_map_cache
     if _company_forced_map_cache is not None:
         return _company_forced_map_cache
-    m = {}
-    try:
-        cur = map_conn.cursor()
-        cur.execute(f"SELECT originalvalue, anonymizedvalue FROM [{MAP_SCHEMA}].[{XREF}] "
-                    f"WHERE description='CompanyName' AND originalvalue IS NOT NULL "
-                    f"AND anonymizedvalue IS NOT NULL")
-        for orig, fake in cur.fetchall():
-            k = (orig or '').strip().lower()
-            if k and fake and k != fake.strip().lower():
-                m[k] = fake
-        log(f"  loaded {len(m):,} company forced-fakes from {XREF} (CompanyName)")
-    except Exception as e:
-        log(f"  (warn: could not load company forced-map from {XREF}: {str(e)[:80]})")
-    for k, v in MANUAL_COMPANY_MAP.items():
-        m[k.strip().lower()] = v          # manual overrides always win
+    m = {k.strip().lower(): v for k, v in MANUAL_COMPANY_MAP.items() if k.strip()}
+    log(f"  company forced-map: {len(m):,} manually-curated entries (MANUAL_COMPANY_MAP)")
     _company_forced_map_cache = m
     return m
 
@@ -3291,7 +3304,7 @@ def scrub_text(text, gl, engine, known=None, domain='general', company_map=None)
     `domain`/`company_map` -- see scrub_post()/apply_literal_map() docstrings (fixes C/A/D).
     For domain != 'resume', a SECOND GLiNER pass runs on an HTML-stripped copy of the
     post-scrub text to catch entities whose signal was diluted by markup in the first pass
-    (fix A); its hits and the mapping_xref-backed company map (fix D) are applied as literal
+    (fix A); its hits and the MANUAL_COMPANY_MAP backstop (fix D) are applied as literal
     substitutions, never offset splicing, so they're safe against the stripped/original text
     not being the same string."""
     pre, protect = scrub_pre(text, engine, known)
@@ -3310,7 +3323,8 @@ def scrub_text(text, gl, engine, known=None, domain='general', company_map=None)
                 lit_map[low] = engine.fake(span, t)
             scrubbed = apply_literal_map(scrubbed, lit_map, protect)
     if company_map:
-        scrubbed = apply_literal_map(scrubbed, company_map, protect)
+        scrubbed = apply_literal_map(scrubbed, company_map, protect,
+                                      pattern_cache=_scrub_text_company_pattern_cache)
     return scrubbed
 
 
@@ -3377,12 +3391,8 @@ def run_inplace(cur, tbl, anon, enabled, limit, order_override, gl, prefer_clean
     # domain-scoped freetext hardening (fixes C/A/D) -- see run()'s equivalent setup and
     # FIX_GUIDE_freetext_domain_scope_and_forced_company_map.md.
     domain = table_domain(tbl)
-    company_forced_map = {}
-    if any(c.get('mode') == 'freetext' for c in enabled):
-        try:
-            _mc = connect_map(); company_forced_map = load_company_forced_map(_mc); _mc.close()
-        except Exception as e:
-            log(f"  (warn: company forced-map load failed: {str(e)[:80]})")
+    company_forced_map = (load_company_forced_map()
+                          if any(c.get('mode') == 'freetext' for c in enabled) else {})
     for c in enabled:                          # 'region' columns: build the real region pool
         if c.get('type') == 'region' and c.get('country_column'):
             # from the SOURCE table (tbl), never anon -- anon may already hold partially-faked
