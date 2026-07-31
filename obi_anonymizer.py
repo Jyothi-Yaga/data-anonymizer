@@ -420,6 +420,7 @@ class FakeEngine:
         self._xref = None                     # (label,orig)->fake and orig->fake
         self._xref_any = None
         self._xref_ids = {}                   # nk -> mapping_xref.id (parallel to _xref_any) for logging
+        self._non_pii = set()                 # normalized originals flagged is_pii='N' -- never faked
         self._relabeled = 0
         # batched writes (flushed per commit) — avoids per-value round-trips
         self._pending_ins = []                # [(label, original, fake)]
@@ -509,26 +510,48 @@ class FakeEngine:
     def _load_xref(self):
         """Preload the whole shared mapping (obi.mapping_slice) once from the MAPPING connection:
         build the lookup dicts and seed the injectivity ledger. Avoids per-value round-trips.
-        Also records the row id per normalized-original so per-cell logs can report REUSE:<id>."""
+        Also records the row id per normalized-original so per-cell logs can report REUSE:<id>.
+
+        `is_pii` (added to mapping_xref after a manual review pass) flags rows that entered the
+        table via an over-eager blanket harvest but aren't actually PII -- confirmed live:
+        4,414 'N' rows are bare junk tokens ('A', 'Admin', '1 1', '?', 'Aj') that got harvested
+        as if they were real person names (the same HARVEST_STOP-shaped false-positive class
+        this project has hit repeatedly), each carrying a bogus fake ('Admin' -> 'Norma Short').
+        These are excluded entirely: not loaded into the reuse-first cache (so a future run
+        never reuses the bogus fake), and their original value is tracked in self._non_pii so
+        fake() below leaves any matching value alone rather than routing it through
+        generation/reuse at all. Their OLD fake string is still added to self._used, though --
+        it's already sitting in the shared table under this now-disowned original, so treating
+        it as available again would let a genuinely different original collide onto the same
+        fake string. New rows this run persists don't set is_pii (NULL) and are treated as
+        normal/includable, same as rows from before this column existed."""
         self._xref, self._xref_any = {}, {}
         self._xref_ids = {}
+        self._non_pii = set()
         try:
             mc = connect_map()                             # fresh short-lived read connection
             rows = mc.cursor().execute(
-                f"SELECT id, description, originalvalue, anonymizedvalue "
+                f"SELECT id, description, originalvalue, anonymizedvalue, is_pii "
                 f"FROM [{MAP_SCHEMA}].[{XREF}] WHERE originalvalue IS NOT NULL "
                 f"AND anonymizedvalue IS NOT NULL").fetchall()
             mc.close()
         except Exception as e:
             log(f"  (warn: could not preload {XREF}: {e})"); return
-        for rid, desc, orig, fake in rows:
+        skipped_non_pii = 0
+        for rid, desc, orig, fake, is_pii in rows:
             if not orig or not fake: continue
             nk = self.normalize(orig)                  # case/space-insensitive reuse key
+            if (is_pii or '').strip().upper() == 'N':
+                self._non_pii.add(nk)
+                self._used.add(fake.strip().casefold())
+                skipped_non_pii += 1
+                continue
             self._xref_any.setdefault(nk, fake)
             self._xref_ids.setdefault(nk, rid)
             if desc: self._xref[(desc.strip().casefold(), nk)] = fake
             self._used.add(fake.strip().casefold())
-        log(f"  loaded {len(rows):,} {XREF} pairs from shared map (reuse-first)")
+        log(f"  loaded {len(rows) - skipped_non_pii:,} {XREF} pairs from shared map (reuse-first)"
+            f"  [{skipped_non_pii:,} is_pii='N' rows excluded from consideration]")
 
     def _uniq(self, cand, seedkey, make):
         """Injectivity (bijective) with CLEAN output — no hex/number suffixes.
@@ -1454,6 +1477,13 @@ class FakeEngine:
         if original is None: return None
         original = str(original)
         if len(original.strip()) <= 1: return original
+        # mapping_xref.is_pii='N': a manual review pass flagged this exact original as NOT
+        # actually PII (it only entered the map via an over-eager blanket harvest -- see
+        # _load_xref's docstring for confirmed examples: 'Admin', 'A', '1 1', '?'). Leave it
+        # completely unchanged rather than reusing/regenerating a fake for it.
+        if self.normalize(original) in self._non_pii:
+            self._log_outcome(original, original, 'NOT-PII-SKIPPED')
+            return original
         # SAFETY: a value already carrying a reserved forced-fake word (e.g. '…@aventraa.com')
         # is already anonymized — return it unchanged instead of re-faking (which would persist a
         # fake as an "original" and pollute mapping_xref, e.g. when re-running on anonymized data).
