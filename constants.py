@@ -165,6 +165,7 @@ FORCED_MAP = {
     'centific': 'aventraa',
     'pactera':  'eventraa',
     'pacteraedge': 'eventraaedge',
+    'uber':'Sanchez-Harris'
 }
 
 # ── manually curated company overrides (fix D's ONLY input -- see below) ────────────────────

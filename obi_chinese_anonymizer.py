@@ -33,9 +33,46 @@ _HAN_LO, _HAN_HI = '一', '鿿'
 # rather than faked, same rationale as 'admin'/'test'/'string' in the Latin stopword set.
 CN_HARVEST_STOP = {'管理员', '系统', '测试', '未知', '默认', '无', '暂无', '客人', '游客'}
 
+# Chinese equivalent of GENERIC_ENTITY_STOP (constants.py): common business/document
+# vocabulary that can sit as its own isolated, delimiter-bounded Han-script token inside a
+# filename or freetext cell (e.g. '..._测试文件.docx', '..._报价单_...') and would otherwise be
+# mistaken for a company/person name by the freetext Han-script backstop (see scrub_post() in
+# obi_anonymizer.py -- GLiNER has near-zero recall on Han-script entities, confirmed 0 hits at
+# threshold 0.1 on a real vendor name embedded in a filename, so a deterministic token-level
+# backstop fakes any short isolated Han run; this list is what keeps that backstop from also
+# faking ordinary Chinese business nouns). Not morphological -- a flat curated list of both
+# single terms and the compounds they commonly form, same philosophy as GENERIC_ENTITY_STOP.
+CN_GENERIC_STOP = {
+    # document / file types
+    '文件', '测试文件', '附件', '报告', '报表', '清单', '说明', '备注', '草稿', '副本', '版本',
+    '表格', '记录', '简报', '发票', '收据', '凭证', '证明', '模板', '范本', '样本',
+    # pricing / commercial documents
+    '报价', '报价单', '询价', '询价单', '合同', '协议', '框架协议', '框架', '标书', '投标',
+    '中标', '订单', '采购单', '结算', '账单', '预算', '成本', '费用', '金额', '价格', '折扣',
+    '税费', '税率',
+    # process / project vocabulary
+    '需求', '服务', '项目', '计划', '方案', '提案', '建议', '审批', '审核', '确认', '签署',
+    '签约', '核对', '反馈', '沟通', '会议', '讨论', '跟进', '更新', '修订', '变更', '调整',
+    '标注', '标签', 'annotation', '数据', '流程', '进度', '交付', '验收', '任务', '团队',
+    '项目组', '负责人', '联系人', '迭代', '阶段', '提交', '商务', '版本号', '商务报价单',
+    '最终报价确认', '版',
+    # status / qualifier words
+    '最终', '最终版', '初步', '临时', '正式', '内部', '外部', '完成', '已完成', '待定', '取消', '有效',
+    '无效', '已签', '未签', '已审批', '待审批', '通过', '拒绝', '暂停', '进行中', '已发送',
+    '已收到',
+    # generic role/entity nouns (mirrors HARVEST_STOP's 'account'/'customer'/'vendor' etc.)
+    '客户', '供应商', '供应', '公司', '企业', '厂商', '合作方', '甲方', '乙方', '代理商',
+    # time periods (already usually broken up by adjacent digits, kept as a backstop)
+    '年度', '季度', '月度', '本月', '本年', '今年', '去年', '明年',
+}
+
 
 def is_harvest_stop(s):
     return (s or '').strip() in CN_HARVEST_STOP
+
+
+def is_generic_stop(s):
+    return (s or '').strip() in CN_GENERIC_STOP
 
 
 def is_han(s):
@@ -199,6 +236,23 @@ CN_LOCATION_SKIP = {
 def is_location_skip(s):
     """True if s is a known non-place work-mode/status descriptor, not a genuine city/location."""
     return (s or '').strip() in CN_LOCATION_SKIP
+
+
+# Country/region names -- a country reference in freetext (e.g. '...中国大陆...', a filename
+# noting which market a document covers) is not itself PII and should stay verbatim, matching
+# the same policy Latin-script COUNTRY_HINT columns already get (a country is faked to a
+# *different real* country only for a column explicitly typed 'country', never scrubbed out of
+# running freetext). Used by the Han-script freetext backstop (scrub_post) so a bare country
+# mention isn't mistaken for a company/person token.
+CN_COUNTRY_STOP = {
+    '中国', '中国大陆', '大陆', '内地', '香港', '澳门', '台湾', '日本', '韩国', '朝鲜',
+    '美国', '英国', '法国', '德国', '意大利', '西班牙', '俄罗斯', '加拿大', '澳大利亚',
+    '新加坡', '马来西亚', '印度', '印尼', '泰国', '越南', '菲律宾', '巴西', '墨西哥',
+}
+
+
+def is_country_stop(s):
+    return (s or '').strip() in CN_COUNTRY_STOP
 
 
 # Chinese org-name fake material -- combined head+tail (no space, matching real Chinese

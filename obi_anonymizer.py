@@ -3124,7 +3124,59 @@ def scrub_post(text, ents, engine, protect, domain='general'):
             prev = end; last = end
         out.append(text[prev:])
         text = ''.join(out)
+    text = _han_token_backstop(text, engine)
     return engine.apply_forced(text)
+
+
+# GLiNER (English/Latin-centric NER) has near-zero recall on Han-script entities -- confirmed 0
+# hits at threshold 0.1 on a real vendor name sitting inside an otherwise-Latin filename
+# ('..._CQC_昇迪凡科_202510...pdf'), so a real company/person name in Chinese can sail through
+# scrub_post's GLiNER-driven loop above completely untouched. This deterministic backstop runs
+# after that loop (so anything GLiNER DID already fake is now Latin text and won't re-match):
+# any isolated 2-6 character contiguous Han-script run -- bounded by non-Han characters or the
+# string edges, i.e. the shape a name/company token takes in a delimited filename, NOT part of a
+# longer narrative Chinese phrase (which is left alone) -- is faked via _han_org_fake below.
+# Same tradeoff GENERIC_ENTITY_STOP/HARVEST_STOP already accept for Latin script: a flat curated
+# stopword list (CN_HARVEST_STOP/CN_GENERIC_STOP/CN_COUNTRY_STOP in obi_chinese_anonymizer.py),
+# not a perfect classifier -- an unlisted generic Chinese term can still get swept up. Given the
+# alternative is a confirmed real leak, that's an acceptable, correctable-over-time tradeoff.
+_HAN_TOKEN_RE = re.compile('[一-鿿]{1,20}')
+
+def _han_token_backstop(text, engine):
+    if not chinese_anon.is_han(text):
+        return text
+    out, prev = [], 0
+    for m in _HAN_TOKEN_RE.finditer(text):
+        run = m.group(0)
+        if not (2 <= len(run) <= 6):
+            continue
+        if (chinese_anon.is_harvest_stop(run) or chinese_anon.is_generic_stop(run)
+                or chinese_anon.is_country_stop(run)):
+            continue
+        out.append(text[prev:m.start()]); out.append(_han_org_fake(run, engine))
+        prev = m.end()
+    out.append(text[prev:])
+    return ''.join(out)
+
+
+def _han_org_fake(run, engine):
+    """Like engine.fake(run, 'org'), but bypasses xref_lookup's type-AGNOSTIC fallback.
+    Confirmed live: '昇迪凡科' (a real company name) already had a person-labeled ('Names')
+    mapping_xref entry from some other, likely-misclassified column elsewhere -- a fresh
+    org-typed request for the identical string got that person-shaped fake back instead of a
+    company-shaped one, since xref_lookup's fallback tier matches purely on the string,
+    ignoring type. Reuse only a genuinely org-labeled ('CompanyName') prior entry; otherwise
+    generate fresh via the Chinese org generator and persist it under the correct label --
+    _persist() writes straight into engine._xref keyed by that label (not just the
+    type-agnostic _xref_any), so this also self-heals any later same-run 'org' lookup for the
+    same string, not just this backstop's own calls."""
+    nk = engine.normalize(run)
+    cached = engine._xref.get((XREF_TYPE['org'].casefold(), nk))
+    if cached:
+        return cached
+    fresh = engine.apply_forced(chinese_anon.gen_chinese_org(run, engine._seed, engine._used))
+    engine._persist(run, fresh, 'org')
+    return fresh
 
 
 # ════════════════════════════════════════════════════════════════════════════════
