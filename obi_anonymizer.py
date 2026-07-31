@@ -89,13 +89,13 @@ _load_dotenv()
 # SQL Server / Docker holding a migrated slice) without editing this file.
 # DATA connection — the tables being anonymized (e.g. local SQL Server holding the slice).
 CS = os.environ.get('OBI_ANON_CS') or (
-      'DRIVER={ODBC Driver 17 for SQL Server};'
+      'DRIVER={ODBC Driver 18 for SQL Server};'
       'SERVER=obi-poc-server.database.windows.net;DATABASE=obi-sql-db;'
       'UID=obi_admin;PWD=__SET_VIA_ENV__;Encrypt=yes;TrustServerCertificate=no;')
 # MAPPING connection — the SHARED single source of truth `obi.mapping_slice` on Azure obi-sql-db.
 # Data may be local while the mapping is remote/shared; override with OBI_MAP_CS if needed.
 MAP_CS = os.environ.get('OBI_MAP_CS') or (
-      'DRIVER={ODBC Driver 17 for SQL Server};'
+      'DRIVER={ODBC Driver 18 for SQL Server};'
       'SERVER=obi-poc-server.database.windows.net;DATABASE=obi-sql-db;'
       'UID=obi_admin;PWD=__SET_VIA_ENV__;Encrypt=yes;TrustServerCertificate=no;')
 SCHEMA = 'obi'                                # DATA schema -- overridable via --schema (e.g. obip1)
@@ -377,13 +377,13 @@ def open_value_log(table, dry_run):
         log(f"  (warn: could not open value log for {table}: {str(e)[:80]})")
         return None
 
-def log_value(fh, col, original, fake):
+def log_value(fh, col, original, fake, id_state='GENERATED-NOT-STORED'):
     if fh is None or original is None:
         return
     try:
         o = str(original).replace('\r', ' ').replace('\n', ' ')
         f = str(fake).replace('\r', ' ').replace('\n', ' ')
-        fh.write(f"{col} - {o} - {f}\n")
+        fh.write(f"{col} - {o} - {f} - {id_state}\n")
     except Exception:
         pass
 
@@ -419,11 +419,17 @@ class FakeEngine:
         self._used  = set()                   # injectivity ledger (fakes taken)
         self._xref = None                     # (label,orig)->fake and orig->fake
         self._xref_any = None
+        self._xref_ids = {}                   # nk -> mapping_xref.id (parallel to _xref_any) for logging
         self._relabeled = 0
         # batched writes (flushed per commit) — avoids per-value round-trips
         self._pending_ins = []                # [(label, original, fake)]
+        self._pending_ins_meta = []           # parallel to _pending_ins: [(col, original, fake, ptype)]
         self._pending_upd = []                # [(fake, original)]  (prefer-clean rewrites)
         self._persisted = set()               # originals already queued/written this run
+        # per-cell logging support (populated by run/run_inplace via attach_log/set_log_context)
+        self._vlog = None                     # log file handle (opened by open_value_log)
+        self._current_col = None              # column name of the cell currently being anonymized
+        self._last_id_state = None            # last outcome tag (REUSE:<id>/NEW:pending/NEW:DRY-RUN/GENERATED-NOT-STORED)
         # Shared map (obi.mapping_slice on Azure) = the real target. To survive long idle periods
         # during slow GLiNER batches (Azure closes idle connections -> 08S01), we do NOT hold a
         # persistent Azure connection: flush_pending opens a FRESH short-lived one each time.
@@ -502,21 +508,24 @@ class FakeEngine:
 
     def _load_xref(self):
         """Preload the whole shared mapping (obi.mapping_slice) once from the MAPPING connection:
-        build the lookup dicts and seed the injectivity ledger. Avoids per-value round-trips."""
+        build the lookup dicts and seed the injectivity ledger. Avoids per-value round-trips.
+        Also records the row id per normalized-original so per-cell logs can report REUSE:<id>."""
         self._xref, self._xref_any = {}, {}
+        self._xref_ids = {}
         try:
             mc = connect_map()                             # fresh short-lived read connection
             rows = mc.cursor().execute(
-                f"SELECT description, originalvalue, anonymizedvalue "
+                f"SELECT id, description, originalvalue, anonymizedvalue "
                 f"FROM [{MAP_SCHEMA}].[{XREF}] WHERE originalvalue IS NOT NULL "
                 f"AND anonymizedvalue IS NOT NULL").fetchall()
             mc.close()
         except Exception as e:
             log(f"  (warn: could not preload {XREF}: {e})"); return
-        for desc, orig, fake in rows:
+        for rid, desc, orig, fake in rows:
             if not orig or not fake: continue
             nk = self.normalize(orig)                  # case/space-insensitive reuse key
             self._xref_any.setdefault(nk, fake)
+            self._xref_ids.setdefault(nk, rid)
             if desc: self._xref[(desc.strip().casefold(), nk)] = fake
             self._used.add(fake.strip().casefold())
         log(f"  loaded {len(rows):,} {XREF} pairs from shared map (reuse-first)")
@@ -567,6 +576,35 @@ class FakeEngine:
             v = self._xref.get((label.strip().casefold(), nk))
             if v: return v
         return self._xref_any.get(nk)              # type-agnostic fallback
+
+    def xref_lookup_with_id(self, original, ptype):
+        """Same as xref_lookup, but also returns the mapping_xref row id (or None if not persisted).
+        Used by fake() to emit REUSE:<id> log lines. Returns (id, fake) or (None, None)."""
+        v = self.xref_lookup(original, ptype)
+        if v is None:
+            return (None, None)
+        nk = self.normalize(original)
+        return (self._xref_ids.get(nk), v)
+
+    # -- per-cell logging plumbing (set by run/run_inplace before each cell) -----
+    def attach_log(self, vlog):
+        """Attach the open value-log handle so fake()/_persist() can emit per-cell lines directly."""
+        self._vlog = vlog
+
+    def set_log_context(self, col):
+        """Set the column name for subsequent log lines emitted from fake()/_persist().
+        Also resets _last_id_state so a cell that never reaches _log_outcome (e.g. amount jitter,
+        skip column) can default to GENERATED-NOT-STORED at flush time."""
+        self._current_col = col
+        self._last_id_state = 'GENERATED-NOT-STORED'
+
+    def _log_outcome(self, original, fake, id_state):
+        """Record the outcome of an anonymization decision. Writes one line to the value log
+        (if attached) and stores id_state on the engine so callers can read it if they want to
+        double-log at cell granularity."""
+        self._last_id_state = id_state
+        if self._vlog is not None and self._current_col is not None and original is not None:
+            log_value(self._vlog, self._current_col, original, fake, id_state)
 
     # -- ethnicity / script ------------------------------------------------------
     def _is_han(self, s):
@@ -1252,6 +1290,12 @@ class FakeEngine:
         # in-memory update is immediate so lookups this run stay consistent
         self._xref_any.setdefault(nk, fake)
         self._xref[(label.strip().casefold(), nk)] = fake
+        # id/url types are deterministic (sha256-seeded, class-preserving) and are intentionally
+        # NOT persisted to mapping_xref -- storing millions of GUIDs would bloat the shared map,
+        # and re-runs regenerate identical fakes without any table state (see ENGINE_CHANGES.md #4).
+        if ptype in ('id', 'url'):
+            self._log_outcome(original, fake, 'GENERATED-NOT-STORED')
+            return
         # queue the DB write (skip oversized — nvarchar(256) limit; xref.originalvalue IS
         # nvarchar, confirmed against the live schema, so non-ASCII/Chinese text is NOT
         # skipped here -- it round-trips fine and needs to persist for cross-run reuse).
@@ -1263,40 +1307,102 @@ class FakeEngine:
                 and len(original) <= MAX_LOOKUP_LEN and len(fake) <= MAX_LOOKUP_LEN):
             self._persisted.add(nk)
             self._pending_ins.append((label, original, fake))
+            self._pending_ins_meta.append((self._current_col, original, fake, ptype))
+            # dry-run writes to a local temp table; the real id doesn't matter -> log immediately.
+            # real (shared-map) run: id is assigned on flush; emit a pending marker for now, the
+            # resolved NEW:<id> line is written by flush_pending() after OUTPUT INSERTED.id.
+            if not self._shared:
+                self._log_outcome(original, fake, 'NEW:DRY-RUN')
+            else:
+                self._log_outcome(original, fake, 'NEW:pending')
+        else:
+            # guard-rejected: no-op, oversized, already-queued, or persist_enabled=False.
+            self._log_outcome(original, fake, 'GENERATED-NOT-STORED')
 
     def flush_pending(self):
         """Write queued mapping inserts/updates in bulk and COMMIT. For the shared Azure map we
         open a FRESH connection here (and retry once on a dropped link) so a long-idle connection
         during slow GLiNER batches can't 08S01 us. Dry-run writes to the local temp table via the
         stable data connection. Safe to insert plainly — we preloaded the table, so queued
-        originals are known-new (in-memory dedup)."""
+        originals are known-new (in-memory dedup).
+
+        Real-run INSERT uses ``OUTPUT INSERTED.id`` in sub-batches (≤500 rows/statement so total
+        params stay under SQL Server's 2100 limit) so we can log the assigned id per new row and
+        also backfill self._xref_ids for same-run second lookups."""
         if not self._pending_ins and not self._pending_upd:
             return
         wt = self.write_table
         ins, upd = self._pending_ins, self._pending_upd
-        self._pending_ins, self._pending_upd = [], []
+        meta = self._pending_ins_meta
+        self._pending_ins, self._pending_upd, self._pending_ins_meta = [], [], []
         # dry-run writes to a throwaway table alongside the DATA (SCHEMA); a real run writes to
         # the shared mapping table, which always lives in MAP_SCHEMA regardless of --schema.
         sch = MAP_SCHEMA if self._shared else SCHEMA
-        insert_sql = f"INSERT INTO [{sch}].[{wt}](description,originalvalue,anonymizedvalue) VALUES (?,?,?)"
         update_sql = f"UPDATE [{sch}].[{wt}] SET anonymizedvalue=? WHERE originalvalue=?"
+        insert_sql_plain = f"INSERT INTO [{sch}].[{wt}](description,originalvalue,anonymizedvalue) VALUES (?,?,?)"
 
-        def _do(conn):
+        def _do_dryrun(conn):
             cur = conn.cursor()
             try: cur.fast_executemany = True
             except Exception: pass
-            if ins: cur.executemany(insert_sql, ins)
+            if ins: cur.executemany(insert_sql_plain, ins)
             if upd: cur.executemany(update_sql, upd)
             conn.commit()
 
+        def _do_real(conn):
+            """Real-run flush: multi-row INSERT with OUTPUT so we can log the new ids and
+            backfill self._xref_ids. Sub-batches to keep param count ≤ 2100."""
+            cur = conn.cursor()
+            if ins:
+                # 500 rows × 3 cols = 1500 params — safely under the 2100-param limit
+                per_stmt = 500
+                for i in range(0, len(ins), per_stmt):
+                    chunk = ins[i:i + per_stmt]
+                    meta_chunk = meta[i:i + per_stmt]
+                    values_sql = ",".join(["(?,?,?)"] * len(chunk))
+                    sql = (f"INSERT INTO [{sch}].[{wt}](description,originalvalue,anonymizedvalue) "
+                           f"OUTPUT INSERTED.id VALUES {values_sql}")
+                    flat = [x for row in chunk for x in row]
+                    cur.execute(sql, flat)
+                    returned_ids = [r[0] for r in cur.fetchall()]
+                    # SQL Server does not guarantee OUTPUT ordering matches VALUES order without
+                    # a sorted OUTPUT INTO ... trick; empirically the ordering aligns for a simple
+                    # INSERT ... VALUES, but to be safe we look up ids by (originalvalue, fake) if
+                    # counts diverge. Counts should be equal for INSERT.
+                    if len(returned_ids) == len(meta_chunk):
+                        for (col_name, orig, fk, ptype), new_id in zip(meta_chunk, returned_ids):
+                            nk = self.normalize(orig)
+                            self._xref_ids[nk] = new_id
+                            if self._vlog is not None and col_name is not None:
+                                log_value(self._vlog, col_name, orig, fk, f'NEW:{new_id}')
+                    else:
+                        # fallback: at least backfill via a per-row SELECT so future lookups can log REUSE:<id>
+                        for col_name, orig, fk, ptype in meta_chunk:
+                            try:
+                                row = cur.execute(
+                                    f"SELECT TOP 1 id FROM [{sch}].[{wt}] WHERE originalvalue=? AND anonymizedvalue=? ORDER BY id DESC",
+                                    orig, fk).fetchone()
+                                if row and row[0] is not None:
+                                    nk = self.normalize(orig)
+                                    self._xref_ids[nk] = row[0]
+                                    if self._vlog is not None and col_name is not None:
+                                        log_value(self._vlog, col_name, orig, fk, f'NEW:{row[0]}')
+                            except Exception:
+                                pass
+            if upd:
+                try: cur.fast_executemany = True
+                except Exception: pass
+                cur.executemany(update_sql, upd)
+            conn.commit()
+
         if not self._shared:                        # dry-run: local temp table, stable connection
-            try: _do(self._pconn)
+            try: _do_dryrun(self._pconn)
             except Exception as e: log(f"  (warn: flush to {wt} failed, {str(e)[:80]})")
             return
         # shared Azure map: fresh connection, one retry on a dropped link
         for attempt in (1, 2):
             try:
-                mc = connect_map(); _do(mc); mc.close(); return
+                mc = connect_map(); _do_real(mc); mc.close(); return
             except Exception as e:
                 if attempt == 1:
                     log(f"  (map flush retry after: {str(e)[:70]})")
@@ -1352,6 +1458,7 @@ class FakeEngine:
         # is already anonymized — return it unchanged instead of re-faking (which would persist a
         # fake as an "original" and pollute mapping_xref, e.g. when re-running on anonymized data).
         if _RESERVED_FAKE_RE.search(original):
+            self._log_outcome(original, original, 'GENERATED-NOT-STORED')
             return original
         # Filename guard: fake only the stem, keep the real extension verbatim (case as written).
         # Recurses through this same fake() on the stem alone, so caching/reuse-first/mapping_xref
@@ -1373,10 +1480,12 @@ class FakeEngine:
         if ptype in ('person', 'org'):
             norm = self.normalize(original)
             if norm in WORKFLOW_LABEL_STOP:
+                self._log_outcome(original, original, 'GENERATED-NOT-STORED')
                 return original
             if ' ' not in original.strip():
                 if (norm in HARVEST_STOP or norm.rstrip('0123456789') in HARVEST_STOP
                         or chinese_anon.is_harvest_stop(original)):
+                    self._log_outcome(original, original, 'GENERATED-NOT-STORED')
                     return original
         if looks_like_id(original):        # runtime guard: shape overrides declared type —
             ptype = 'id'                   # a GUID/account-id never gets person/org treatment
@@ -1419,7 +1528,7 @@ class FakeEngine:
                        'location': self._gen_location,
                        'org': self._gen_org}.get(ptype, self._gen_org)(o)
             return self.apply_forced(r)    # ensure centific/pactera never survives (e.g. phone-typed text)
-        val = self.xref_lookup(canon, ptype)              # 1) reuse existing mapping
+        xref_id, val = self.xref_lookup_with_id(canon, ptype)   # 1) reuse existing mapping
         if val is not None and id_hint:
             # A compound id-type value (e.g. '<EmployeeId>_<CreateDate>') must always embed
             # THIS row's companion column's own fake for its delimited segment(s) -- a stale
@@ -1435,18 +1544,24 @@ class FakeEngine:
             if fresh != val:
                 self._rewrite_xref(canon, fresh, ptype)
                 val = fresh
+                # rewrite -> the previously-recorded xref_id now points to a different fake;
+                # log the effective outcome as a REUSE of that map row (id unchanged, value replaced).
+                self._log_outcome(original, val, f'REUSE:{xref_id}' if xref_id else 'GENERATED-NOT-STORED')
             else:
                 self._used.add(val.strip().casefold())
+                self._log_outcome(original, val, f'REUSE:{xref_id}' if xref_id else 'GENERATED-NOT-STORED')
         elif val is not None and self.prefer_clean and _DIRTY_RE.search(val):
             new = gen(canon); self._rewrite_xref(canon, new, ptype)
             val = new; self._relabeled += 1
+            self._log_outcome(original, val, f'REUSE:{xref_id}' if xref_id else 'GENERATED-NOT-STORED')
         elif val is not None:
             self._used.add(val.strip().casefold())
             if ptype == 'person':
                 self._backfill_name_tokens(canon, val)
+            self._log_outcome(original, val, f'REUSE:{xref_id}' if xref_id else 'GENERATED-NOT-STORED')
         else:                                            # 2) generate + persist new
             val = gen(canon)
-            self._persist(original, val, ptype)
+            self._persist(original, val, ptype)          # _persist emits the NEW/GEN-NOT-STORED log line
         self._cache[key] = val
         return val
 
@@ -2114,6 +2229,7 @@ def run(cur, tbl, limit, restart, order_override, gl, prefer_clean=False, dry_ru
     vlog = open_value_log(tbl, dry_run)   # logs/<tbl>/{dryrun,runv<version>}.log
     engine = FakeEngine(cur, prefer_clean=prefer_clean, persist_enabled=True,
                         write_table=(dry_map if dry_run else XREF))
+    engine.attach_log(vlog)   # fake()/_persist()/flush_pending() emit per-cell log lines with REUSE:<id>/NEW:<id>
     if dry_run:
         log(f"  dry-run: new original->fake pairs go to [{SCHEMA}].[{dry_map}] "
             f"(mapping_xref is read-only)")
@@ -2358,8 +2474,11 @@ def run(cur, tbl, limit, restart, order_override, gl, prefer_clean=False, dry_ru
         if c is None or value is None: return value
         if not _row_filter_passes(c, row):
             return value
+        engine.set_log_context(colname)   # every log line emitted inside fake() carries this col
         if c['type'] == 'amount':                     # numeric price/qty -> ±15% jitter
-            return jitter_amount(value)
+            v = jitter_amount(value)
+            engine._log_outcome(str(value), v, 'GENERATED-NOT-STORED')  # amount bypasses fake()
+            return v
         if c['mode'] == 'freetext':
             return scrub_text(str(value), gl, engine, known, domain=domain, company_map=company_forced_map)
         hint = _row_name_hint(str(value), row) if (c['type'] == 'email' and row is not None
@@ -2433,6 +2552,7 @@ def run(cur, tbl, limit, restart, order_override, gl, prefer_clean=False, dry_ru
                     row_tokens = _row_person_tokens(row, known) if known else None
                     for ci in ft_idx:
                         if row[ci] is None: continue
+                        engine.set_log_context(insert_cols[ci])   # freetext span logs need the col name
                         pre, protect = scrub_pre(str(row[ci]), engine, known, row_tokens)
                         pre_cache[(ri, ci)] = [pre, protect, None]
                         keys.append((ri, ci)); texts.append(pre)
@@ -2444,6 +2564,7 @@ def run(cur, tbl, limit, restart, order_override, gl, prefer_clean=False, dry_ru
                 stage1 = {}
                 for k in keys:
                     ri, ci = k
+                    engine.set_log_context(insert_cols[ci])   # per-cell col context for scrub_post spans
                     pre, protect, ents = pre_cache[k]
                     v1 = scrub_post(pre, ents or [], engine, protect, domain=domain)
                     v1 = _json_safe_fallback(rows[ri][ci], v1, pre)
@@ -2467,6 +2588,7 @@ def run(cur, tbl, limit, restart, order_override, gl, prefer_clean=False, dry_ru
                 # for specific companies you've curated, regardless of what GLiNER did or missed.
                 for k in keys:
                     ri, ci = k
+                    engine.set_log_context(insert_cols[ci])   # per-cell col context for stage-2 spans
                     pre, protect, ents = pre_cache[k]
                     v = stage1[k]
                     if sec_ents.get(k):
@@ -2493,8 +2615,10 @@ def run(cur, tbl, limit, restart, order_override, gl, prefer_clean=False, dry_ru
                     else:
                         v = anon_val(cn, row[i], known, row, id_hint_pool)
                     v = fit_width(v, maxlen.get(cn))   # #2 word-boundary clamp to column width
-                    if cn.lower() in enabled_map:
-                        log_value(vlog, cn, row[i], v)
+                    # NOTE: per-cell/per-span logging is emitted from inside engine.fake()/_persist()/
+                    # flush_pending() via engine._log_outcome, so we do NOT log here (avoids double-log).
+                    # amount cells are logged inside anon_val (they bypass fake()); freetext cells are
+                    # logged one line per detected span from within scrub_text -> engine.fake(span).
                     newrow.append(v)
                 out.append(newrow)
             cur.executemany(
@@ -3263,6 +3387,7 @@ def run_inplace(cur, tbl, anon, enabled, limit, order_override, gl, prefer_clean
 
     vlog = open_value_log(tbl, dry_run=False)   # logs/<tbl>/runv<version>.log (never a dry-run here)
     engine = FakeEngine(cur, prefer_clean=prefer_clean, persist_enabled=True, write_table=XREF)
+    engine.attach_log(vlog)   # per-cell log emission (REUSE:<id>/NEW:<id>/GENERATED-NOT-STORED)
     # domain-scoped freetext hardening (fixes C/A/D) -- see run()'s equivalent setup and
     # FIX_GUIDE_freetext_domain_scope_and_forced_company_map.md.
     domain = table_domain(tbl)
@@ -3406,8 +3531,11 @@ def run_inplace(cur, tbl, anon, enabled, limit, order_override, gl, prefer_clean
                     rfval = row[pos.get(rf['column'])] if rf['column'] in pos else None
                     if rfval is None or str(rfval) not in rf.get('in', []):
                         newvals.append(v); continue   # filter column doesn't match -- leave untouched
+                engine.set_log_context(c['column'])   # every engine-emitted log line for this cell tags this col
+                orig_v = v
                 if v is not None and c['type'] == 'amount':
                     v = jitter_amount(v)
+                    engine._log_outcome(str(orig_v), v, 'GENERATED-NOT-STORED')  # amount bypasses fake()
                 elif v is not None and c['mode'] == 'freetext':
                     v = scrub_text(str(v), gl, engine, domain=domain, company_map=company_forced_map)
                 elif v is not None:
@@ -3420,9 +3548,10 @@ def run_inplace(cur, tbl, anon, enabled, limit, order_override, gl, prefer_clean
                         if cidx is not None and row[cidx] is not None:
                             country_hint = str(row[cidx])
                     v = engine.fake(v, c['type'], col=c['column'], name_hint=hint, id_hint=id_hint,
-                                    country_hint=country_hint)   # col -> role
+                                    country_hint=country_hint)   # col -> role  (logs from inside fake())
                 v = fit_width(v, maxlen.get(c['column']))   # #2 word-boundary clamp
-                log_value(vlog, c['column'], row[pos[c['column']]], v)
+                # NOTE: per-cell/per-span log lines are emitted inside engine.fake()/_persist()/
+                # flush_pending() -- no double-log here (see corresponding note in run()).
                 newvals.append(v)
             upd.append(tuple(newvals) + tuple(keyvals))
         cur.executemany(f"UPDATE [{SCHEMA}].[{anon}] SET {set_clause} WHERE {where_clause}", upd)
