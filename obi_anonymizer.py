@@ -2511,6 +2511,9 @@ def run(cur, tbl, limit, restart, order_override, gl, prefer_clean=False, dry_ru
             return v
         if c['mode'] == 'freetext':
             return scrub_text(str(value), gl, engine, known, domain=domain, company_map=company_forced_map)
+        if c['type'] == 'org_code':      # composite/coded org value -- see obi_org_microfake.py
+            from obi_org_microfake import micro_org_fake
+            return micro_org_fake(str(value), engine)
         hint = _row_name_hint(str(value), row) if (c['type'] == 'email' and row is not None
                                                    and '@' in str(value)) else None
         id_hint = id_hint_pool if c['type'] == 'id' else None
@@ -3415,6 +3418,11 @@ def run_inplace(cur, tbl, anon, enabled, limit, order_override, gl, prefer_clean
     UPDATE — never truncates/rebuilds/drops it. Used when the target already holds
     foreign/old rows (no checkpoint) and the caller passed --columns. Reads only the key
     column(s) + requested columns, so unrelated columns/types elsewhere don't matter."""
+    # local import: obi_freetext_bulk imports scrub_pre/scrub_post etc. FROM this module,
+    # so a top-of-file import here would be circular (those aren't defined yet at that point
+    # in obi_anonymizer.py's own top-to-bottom execution) -- deferring until this function is
+    # actually called (i.e. after the whole module has finished loading) avoids that.
+    from obi_freetext_bulk import bulk_scrub_freetext
     acols = columns(cur, anon)
     keys = key_columns(cur, anon, order_override, acols, source_tbl=tbl)
     if keys is None:
@@ -3475,6 +3483,8 @@ def run_inplace(cur, tbl, anon, enabled, limit, order_override, gl, prefer_clean
     domain = table_domain(tbl)
     company_forced_map = (load_company_forced_map()
                           if any(c.get('mode') == 'freetext' for c in enabled) else {})
+    inplace_company_pattern_cache = {}         # persists across batches -- see apply_literal_map's
+                                                # docstring for the perf incident an uncached regex caused
     for c in enabled:                          # 'region' columns: build the real region pool
         if c.get('type') == 'region' and c.get('country_column'):
             # from the SOURCE table (tbl), never anon -- anon may already hold partially-faked
@@ -3601,8 +3611,32 @@ def run_inplace(cur, tbl, anon, enabled, limit, order_override, gl, prefer_clean
         if len(rows) != len(batch_keys):
             log(f"  WARNING: batch expected {len(batch_keys)} row(s) by key but found {len(rows)} "
                 f"-- some snapshotted keys no longer resolve to a row (deleted since snapshot?)")
+        # BATCHED free-text (same algorithm run() already uses for its INSERT path, see
+        # obi_freetext_bulk.py's module docstring for why this replaced a per-cell scrub_text()
+        # call here): collect every freetext cell across the WHOLE batch first, run ONE set of
+        # batched GLiNER passes over all of them together, THEN do the per-row assembly loop.
+        freetext_results = {}
+        if freetext:
+            items = []                # (row_idx, col_name, text) for every cell going into this batch
+            for ri, row in enumerate(rows):
+                for c in freetext:
+                    v = row[pos[c['column']]]
+                    if v is None:
+                        continue
+                    rf = c.get('row_filter')
+                    if rf:
+                        rfval = row[pos.get(rf['column'])] if rf['column'] in pos else None
+                        if rfval is None or str(rfval) not in rf.get('in', []):
+                            continue   # filter column doesn't match -- leave untouched, same as below
+                    items.append((ri, c['column'], str(v)))
+            if items:
+                scrubbed = bulk_scrub_freetext(
+                    [(col, txt) for _, col, txt in items], gl, engine, domain=domain,
+                    company_map=company_forced_map, pattern_cache=inplace_company_pattern_cache)
+                for (ri, col, _), v in zip(items, scrubbed):
+                    freetext_results[(ri, col)] = v
         upd = []
-        for row in rows:
+        for ri, row in enumerate(rows):
             keyvals = [v for k in keys for v in (row[pos[k]], row[pos[k]])]  # doubled -- see _null_safe_eq
             id_hint_pool = _inplace_id_hint_pool(row)
             newvals = []
@@ -3619,7 +3653,10 @@ def run_inplace(cur, tbl, anon, enabled, limit, order_override, gl, prefer_clean
                     v = jitter_amount(v)
                     engine._log_outcome(str(orig_v), v, 'GENERATED-NOT-STORED')  # amount bypasses fake()
                 elif v is not None and c['mode'] == 'freetext':
-                    v = scrub_text(str(v), gl, engine, domain=domain, company_map=company_forced_map)
+                    v = freetext_results.get((ri, c['column']), v)   # pre-computed above, batched
+                elif v is not None and c['type'] == 'org_code':   # see obi_org_microfake.py
+                    from obi_org_microfake import micro_org_fake
+                    v = micro_org_fake(str(v), engine)
                 elif v is not None:
                     hint = _inplace_name_hint(str(v), row) if (c['type'] == 'email'
                                                                and '@' in str(v)) else None
