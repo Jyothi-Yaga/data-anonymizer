@@ -122,6 +122,18 @@ GENERIC_ENTITY_STOP = {
     'physician', 'physicians', 'supervisor', 'supervisors', 'freshman', 'freshmen', 'profile',
     'profiles', 'telco', 'saas', 'startup', 'startups', 'regex', 'fortune', 'pmp', 'vision',
     'nist', 'cdc',
+    # procurement / purchase-order / contract generic vocabulary (confirmed on
+    # PurchaseOrderLine.MCRDROPSHIPCOMMENT: GLiNER mislabels ordinary PO-comment phrasing as an
+    # org, e.g. 'Old PO' -> org, 'Non-IT Subscription' -> org, 'tax dd consulting' -> org, none
+    # of which name a real person or company -- they're just how a buyer/AP clerk annotates a
+    # line item. Same precision-over-recall tradeoff already applied above for résumé/HR text.
+    'po', 'pos', 'old', 'non', 'subscription', 'subscriptions', 'agreement', 'agreements',
+    'contract', 'contracts', 'consulting', 'filing', 'filings', 'wave', 'waves', 'change',
+    'changes', 'request', 'requests', 'accessory', 'accessories', 'statutory', 'representation',
+    'representations', 'renewal', 'renewals', 'quote', 'quotes', 'order', 'orders', 'shipment',
+    'shipments', 'fee', 'fees', 'rate', 'rates', 'monthly', 'annual', 'quarterly', 'yearly',
+    'license', 'licenses', 'licence', 'licences', 'extension', 'extensions', 'registration',
+    'registrations', 'forecast', 'cost', 'flow', 'dd',
 }
 
 # ── well-known brand/platform names ──────────────────────────────────────────────────────────
@@ -190,4 +202,19 @@ FORCED_MAP = {
 # extra deterministic guarantee.
 MANUAL_COMPANY_MAP = {
     # 'ibm': 'Some Fixed Fake',
+
+    # Found on PurchaseOrderLine.MCRDROPSHIPCOMMENT: left unchanged because each name contains
+    # a pre-existing GENERIC_ENTITY_STOP word ('cloud'/'services'), which makes GLiNER's own
+    # detection get discarded whole-span. Values below are each company's OWN existing,
+    # already-established fake -- pulled from mapping_slice/mapping_xref (reused as-is, not
+    # regenerated) so this stays consistent with every prior occurrence of the same company
+    # elsewhere in the project.
+    'alibaba': 'Kinetic Works Radian',                                    # mapping_slice id 5476
+    'amazon web services': 'FakeCompany_00176',                      # mapping_xref id 50499
+    'affinda': 'Meridian Data Cascade',                                   # mapping_xref id 813747
+    'bounce marketing': 'Aurora Quantic',                                 # mapping_xref id 738335
+    'olivine marketing llc': 'Aperture Pinnacle LLC',                     # mapping_slice id 270711
+    'three marketeers commuincations group inc': 'Fathom Nexus Kinetic Group Inc',  # mapping_xref id 737456
+    'whitesource software': 'Pinnacle Obsidian',                          # mapping_xref id 737429
+    'mention solutions sas': 'Pinnacle Solutions SWS',                    # mapping_xref id 738323
 }
