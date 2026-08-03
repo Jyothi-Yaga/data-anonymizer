@@ -81,8 +81,23 @@ def _keep_entity(span, ptype, protect, domain):
     return True
 
 
+def _geo_fake_for_span(span, ptype, engine):
+    """Mirrors scrub_post()'s 'street_address'/'postal_code' special-casing (see that
+    function's comment) -- kept as its own small duplication rather than a shared call for the
+    same reason bulk_scrub_freetext() already duplicates scrub_post()'s filter checks (module
+    docstring): scrub_post() does offset-splicing internally, this module builds a literal map
+    instead, so there's no shared return contract to call through to safely."""
+    if ptype == 'street_address':
+        from location_anonymizer import _split_street_address
+        return _split_street_address(span, engine)
+    if ptype == 'postal_code':
+        from location_anonymizer import _digit_shuffle
+        return _digit_shuffle(span)
+    return engine.fake(span, ptype)
+
+
 def bulk_scrub_freetext(items, gl, engine, domain='general', company_map=None,
-                         known=None, pattern_cache=None):
+                         known=None, pattern_cache=None, geo_aware=False, geo_columns=None):
     """items: list of (col_name, text_or_None) tuples -- typically every free-text
     cell across one row-batch (any number of distinct columns; this function doesn't
     care which row/column a cell belongs to beyond needing the column name for
@@ -93,7 +108,14 @@ def bulk_scrub_freetext(items, gl, engine, domain='general', company_map=None,
 
     `pattern_cache`: pass a dict the CALLER keeps alive across calls (e.g. one per
     run_inplace() invocation) so the company_map regex compiles once, not per batch --
-    see apply_literal_map's docstring for the performance incident this avoids."""
+    see apply_literal_map's docstring for the performance incident this avoids.
+
+    `geo_aware`/`geo_columns` -- opt-in only (default False/None, so every EXISTING freetext
+    caller is completely unaffected). When True, cells whose column name is in `geo_columns`
+    (a set) ALSO run location_anonymizer.detect_geo_entities() on the stripped text and add
+    resolved geo spans into the SAME literal map used for person/org/email/phone -- see
+    location_anonymizer.py's module docstring for why geo detection is folded into this same
+    pass rather than a separate geo-only pipeline."""
     n = len(items)
     out = [None] * n
     pre_list = [None] * n
@@ -117,12 +139,36 @@ def bulk_scrub_freetext(items, gl, engine, domain='general', company_map=None,
         engine.set_log_context(col)
         stripped = stripped_list[i]
         lit_map = {}
+        street_addr_map = {}   # 'street_address' spans, applied SEPARATELY -- see below
         for s, e, t in ents_by_idx.get(i, []):
             span = stripped[s:e]
             if not _keep_entity(span, t, protect_list[i], domain):
                 continue
             lit_map[span.casefold()] = engine.fake(span, t)
-        v = apply_literal_map(pre_list[i], lit_map, protect_list[i])
+        if geo_aware and geo_columns and col in geo_columns:
+            from location_anonymizer import detect_geo_entities
+            geo_ents = detect_geo_entities(stripped, engine, gl=gl, column=col)
+            for s, e, t in geo_ents:
+                span = stripped[s:e]
+                if span.casefold() in lit_map or len(span) < 2:
+                    continue      # standard person/org/email/phone entities win on overlap
+                if t == 'street_address':
+                    street_addr_map[span] = _geo_fake_for_span(span, t, engine)
+                else:
+                    lit_map[span.casefold()] = _geo_fake_for_span(span, t, engine)
+        v = pre_list[i]
+        # applied via plain exact replacement, NOT apply_literal_map/lit_map -- a street-address
+        # fake is already a hand-composed mix of verbatim (house number/direction/suffix) and
+        # freshly-faked (street name) segments with its OWN correct internal case pattern;
+        # apply_literal_map's case_like(original_span, fake) re-cases the WHOLE fake to match
+        # the ORIGINAL span's overall case, which mangles that internal mix (confirmed the hard
+        # way: '1115 SE 164th Street' -> '1115 SE Greystone Street' fed through case_like turned
+        # the correctly-preserved 'SE' into 'Se', since case_like .capitalize()s every alpha run
+        # of a Title-cased match). Safe as a plain replace: these spans are long, distinctive,
+        # multi-word strings, not short tokens that could coincidentally match unrelated text.
+        for orig_span, fake_val in street_addr_map.items():
+            v = v.replace(orig_span, fake_val)
+        v = apply_literal_map(v, lit_map, protect_list[i])
         # scrub_post() (not called here -- see module docstring) normally applies these two
         # right after its own GLiNER-substitution loop; do the same here so a Han-script
         # company/person name GLiNER's Latin-centric model misses, and any literal

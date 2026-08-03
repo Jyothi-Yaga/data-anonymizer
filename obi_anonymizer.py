@@ -46,6 +46,10 @@ USAGE
 State files live next to this script under ./_state/<table>.{plan,ckpt}.json
 """
 import argparse, calendar, decimal, hashlib, html, json, os, random, re, signal, struct, sys, time, datetime, unicodedata
+try:
+    import pycountry
+except Exception:
+    pycountry = None
 import obi_chinese_anonymizer as chinese_anon
 from constants import (RESUME_DOMAIN_TABLES, table_domain, GENERIC_ENTITY_STOP,
                         KNOWN_BRAND_STOP, _PRONOUN_STOP, FORCED_MAP, MANUAL_COMPANY_MAP)
@@ -149,7 +153,8 @@ MAX_LOOKUP_LEN = 256                          # xref.originalvalue is nvarchar(2
 # xref type label  ->  our internal PII type   (label written into mapping_xref.description)
 XREF_TYPE = {'person': 'Names', 'email': 'Email', 'org': 'CompanyName',
              'name': 'Names', 'phone': 'Phone',
-             'country': 'country', 'location': 'location', 'region': 'Region'}
+             'country': 'country', 'location': 'location', 'region': 'Region',
+             'state_province': 'StateProvince'}
 
 # ── #5 country / location fake pools — map to a DIFFERENT real place (localized, real value,
 # not structural garbage). Deterministic & consistent: same input always -> same output.
@@ -166,6 +171,75 @@ CITIES = ['Riverton', 'Lakewood', 'Fairview', 'Kingsport', 'Brookfield', 'Ashfor
           'Greenville', 'Westbrook', 'Millbrook', 'Oakdale', 'Cedarville', 'Elmwood',
           'Bridgeport', 'Clearwater', 'Newport', 'Silverton', 'Glenwood', 'Fairmont',
           'Sunnyvale', 'Maplewood']
+
+# ── street-name fake pool (location_anonymizer.py's street sub-tokenizer) ───────────────────
+# Deliberately its OWN small curated pool, not the person-surname corpus (_ff/_fl) -- that
+# corpus exists for ethnicity-aware person-name bijection and shares _used with real person
+# fakes; pulling from it here would mean a surname consumed as a fake street name is no longer
+# available as a fake person surname elsewhere, for no benefit.
+STREET_NAMES = ['Rendisson', 'Kestrel', 'Brambly', 'Thornfield', 'Wexford', 'Alderbrook',
+                'Millgate', 'Corwin', 'Ashgrove', 'Barrowfield', 'Dunmore', 'Farrington',
+                'Greystone', 'Hollowell', 'Ironbridge', 'Larkspur', 'Marrow', 'Oakhurst',
+                'Pemberton', 'Quillfeather', 'Rosemont', 'Stonebridge', 'Tavernhill',
+                'Underwood', 'Vellumont', 'Wrenfield']
+# Street-type suffix words kept VERBATIM (never faked) -- sampled from real dyncrm_contact
+# address1_composite data (Ave/St/Blvd/Dr/Rd/Ste/Suite/Unit/Apt/Fl/Bldg all confirmed present).
+STREET_SUFFIX = {'st','street','ave','avenue','blvd','boulevard','dr','drive','rd','road',
+                 'ln','lane','way','pl','place','ct','court','cir','circle','hwy','highway',
+                 'pkwy','parkway','ste','suite','unit','apt','fl','floor','bldg','building',
+                 'sq','square','ter','terrace','trl','trail','loop','row','walk','path'}
+# Column-name hint for the state/province ambiguity tie-breaker (location_anonymizer.py tier
+# 3) -- mirrors the existing COUNTRY_HINT/LOCATION_HINT pattern below, kept separate/narrower
+# so it never touches the unrelated existing 'region' ptype's own column-name conventions.
+STATE_HINT = re.compile(r'(stateorprovince|state_?province|^state$|_state$|^province$|_province$)', re.I)
+
+# ── geographic subdivision (state/province) pools, derived from pycountry ───────────────────
+# Scoped to the SAME 20 countries in COUNTRIES above (not all 249 pycountry covers) -- keeps
+# the fake-country and fake-subdivision universes tied together and reviewable, matching the
+# existing curation discipline for CITIES/COUNTRIES itself. Two separate pools per country
+# because subdivision CODE shape is NOT uniform across countries -- confirmed live: Germany/
+# Canada use 2-letter codes (DE-NW, CA-SK) but Mexico/Egypt/Sweden don't (MX-SIN, EG-LX, SE-S)
+# -- so a bare 2-letter INPUT (e.g. 'AR') must only ever fake to another bare 2-letter code,
+# never a longer one, mirroring _gen_country's own 2-letter/3-letter/full-name branching.
+# Subdivision NAMES are ASCII-folded (_strip_diacritics) before use -- pycountry's official
+# forms carry combining marks (confirmed: India's stored as 'Karnātaka'/'Uttarākhand', not the
+# plain-ASCII 'Karnataka' real-world text will actually contain) that would otherwise never
+# match anything and would look inconsistent with this pipeline's existing ASCII/Latin fakes.
+def _strip_diacritics(s):
+    s = unicodedata.normalize('NFKD', s or '')
+    return ''.join(c for c in s if not unicodedata.combining(c))
+
+def _build_state_province_pools():
+    by_country, all_codes, all_names = {}, [], []
+    if pycountry is None:
+        return by_country, all_codes, all_names
+    for _name, a2, _a3 in COUNTRIES:
+        try:
+            subs = list(pycountry.subdivisions.get(country_code=a2))
+        except Exception:
+            subs = []
+        codes, names = [], []
+        for sub in subs:
+            code_part = sub.code.split('-', 1)[-1]
+            if len(code_part) == 2 and code_part.isalpha():
+                codes.append(code_part)
+            nm = _strip_diacritics(sub.name)
+            if nm:
+                names.append(nm)
+        if codes or names:
+            by_country[a2] = {'codes': codes, 'names': names}
+        all_codes.extend(codes)
+        all_names.extend(names)
+    return by_country, all_codes, all_names
+
+STATE_PROVINCE_BY_COUNTRY, STATE_PROVINCE_CODES, STATE_PROVINCE_NAMES = _build_state_province_pools()
+# fake-country STRING (whatever form _gen_country returned: full name / alpha2 / alpha3) ->
+# alpha2, so _gen_state_province can look up that specific country's own subdivision pool.
+_COUNTRY_STR_TO_A2 = {}
+for _cname, _ca2, _ca3 in COUNTRIES:
+    _COUNTRY_STR_TO_A2[_cname.casefold()] = _ca2
+    _COUNTRY_STR_TO_A2[_ca2.casefold()] = _ca2
+    _COUNTRY_STR_TO_A2[_ca3.casefold()] = _ca2
 
 # ── FORCED substitution rule ─────────────────────────────────────────────────────
 # Hard rule: wherever these words appear (as whole words, any casing, in any column
@@ -420,7 +494,7 @@ class FakeEngine:
         self._xref = None                     # (label,orig)->fake and orig->fake
         self._xref_any = None
         self._xref_ids = {}                   # nk -> mapping_xref.id (parallel to _xref_any) for logging
-        self._non_pii = set()                 # normalized originals flagged is_pii='N' -- never faked
+        self._non_pii = {}                    # normalized original -> {labels it was reviewed non-PII under}
         self._relabeled = 0
         # batched writes (flushed per commit) — avoids per-value round-trips
         self._pending_ins = []                # [(label, original, fake)]
@@ -524,10 +598,21 @@ class FakeEngine:
         it's already sitting in the shared table under this now-disowned original, so treating
         it as available again would let a genuinely different original collide onto the same
         fake string. New rows this run persists don't set is_pii (NULL) and are treated as
-        normal/includable, same as rows from before this column existed."""
+        normal/includable, same as rows from before this column existed.
+
+        self._non_pii is keyed by (normalized original) -> {labels reviewed non-PII under}, NOT
+        a flat "never touch this text again" set -- confirmed on dyncrm_contact.address1_city/
+        address1_stateorprovince/address1_composite: 'New York'/'Singapore'/'United States' were
+        marked is_pii='N' under description 'Country'/'country' (a review of
+        dyncrm_leads_anonymized.address1_country -- a COUNTRY-level field, where a generic place
+        name showing up was judged not sensitive enough to bother faking) and 'NY' under the
+        legacy label 'Address'. None of those labels match 'location' (what address1_city etc.
+        actually use), so a review scoped to one field's low-granularity geography must not
+        silently suppress anonymization of the same text in a genuinely address-identifying
+        field elsewhere -- see fake()'s label-matched check below."""
         self._xref, self._xref_any = {}, {}
         self._xref_ids = {}
-        self._non_pii = set()
+        self._non_pii = {}
         try:
             mc = connect_map()                             # fresh short-lived read connection
             rows = mc.cursor().execute(
@@ -542,7 +627,15 @@ class FakeEngine:
             if not orig or not fake: continue
             nk = self.normalize(orig)                  # case/space-insensitive reuse key
             if (is_pii or '').strip().upper() == 'N':
-                self._non_pii.add(nk)
+                # (label, fake) -- NOT just the label. mapping_xref enforces ONE row per
+                # originalvalue globally (UX_mapping_xref_originalvalue_upperhash is unique on
+                # just the hash of the text, not (text, type)) -- confirmed the hard way: a
+                # type-mismatched is_pii='N' value that fell through to fresh generation always
+                # violated that constraint on insert (e.g. 'New York' already has a row under
+                # 'Country'; trying to INSERT a second one for a 'location' call fails every
+                # time). So a type mismatch must reuse THIS existing fake, never generate a new
+                # one -- there is physically nowhere to put a second fake for the same text.
+                self._non_pii[nk] = ((desc or '').strip().casefold(), fake)
                 self._used.add(fake.strip().casefold())
                 skipped_non_pii += 1
                 continue
@@ -1227,6 +1320,47 @@ class FakeEngine:
         else:                                   out = tgt[0]      # United States -> China
         return case_like(s, out)
 
+    def _gen_state_province(self, original, country=None):
+        """State/province fake -> a DIFFERENT real subdivision, matching input form (bare
+        2-letter code -> 2-letter code, full name -> full name), injective via _pick_unique
+        (each distinct real state/province gets its OWN distinct fake -- unlike _gen_country's
+        many-to-one, states are far fewer and losing the distinction between e.g. California
+        and Texas would be a real information loss).
+
+        `country` -- NOT the real country text (unlike _gen_region's `country` param): the
+        ALREADY-FAKED country string location_anonymizer.py resolved for a sibling country span
+        in the same cell (e.g. 'Georgia United States' resolves 'United States' -> some fake
+        country FIRST, then passes that fake country's own name/code here so 'Georgia' fakes to
+        one of THAT country's real subdivisions -- keeps the fake state/country pairing
+        internally consistent, mirroring _gen_region's 'nearby and makes sense' philosophy
+        without reusing its narrow table-scoped pool). Falls back to the full cross-country
+        pool when no country hint is given or that specific country has no usable pool for the
+        input's form."""
+        s = original.strip(); norm = self.normalize(s)
+        core = re.sub(r'[^A-Za-z]', '', s)
+        want_code = len(core) == 2 and core.isalpha()
+        pool = None
+        if country:
+            a2 = _COUNTRY_STR_TO_A2.get(country.strip().casefold())
+            entry = STATE_PROVINCE_BY_COUNTRY.get(a2) if a2 else None
+            if entry:
+                pool = entry['codes'] if want_code else entry['names']
+        if not pool:
+            pool = STATE_PROVINCE_CODES if want_code else STATE_PROVINCE_NAMES
+        if not pool:                              # pycountry unavailable -- safe no-op
+            return original
+        picked = self._pick_unique(pool, f"state:{norm}", norm)
+        return case_like(s, picked)
+
+    def _gen_street_name(self, original):
+        """Street-NAME fake (the word(s) before a kept-verbatim suffix like 'Ave'/'St') -- a
+        DIFFERENT word from the small curated STREET_NAMES pool, injective, case-matched.
+        Deliberately not routed through _gen_org (would add a descriptor tail / acronym-shape
+        branch neither wanted nor needed for a single street-name token)."""
+        s = original.strip(); norm = self.normalize(s)
+        picked = self._pick_unique(STREET_NAMES, f"street:{norm}", norm)
+        return case_like(s, picked)
+
     def _gen_location(self, original):
         """#5 location/city fake -> a DIFFERENT real city name, case-matched. Deterministic AND
         injective (each distinct original city gets its own distinct fake city, via the same
@@ -1478,12 +1612,28 @@ class FakeEngine:
         original = str(original)
         if len(original.strip()) <= 1: return original
         # mapping_xref.is_pii='N': a manual review pass flagged this exact original as NOT
-        # actually PII (it only entered the map via an over-eager blanket harvest -- see
-        # _load_xref's docstring for confirmed examples: 'Admin', 'A', '1 1', '?'). Leave it
-        # completely unchanged rather than reusing/regenerating a fake for it.
-        if self.normalize(original) in self._non_pii:
-            self._log_outcome(original, original, 'NOT-PII-SKIPPED')
-            return original
+        # actually PII UNDER THE TYPE IT WAS REVIEWED AS (see _load_xref's docstring for the
+        # confirmed incident this label-matching fixes: a 'Country'-type review of a country-
+        # level field wrongly suppressing the same city name in a 'location'-type address
+        # field elsewhere). Only skip-unchanged when THIS call's own type label matches the one
+        # the text was actually reviewed under -- e.g. 'Admin' reviewed as not-a-real-'Names'
+        # still correctly skips a future person-type call for 'Admin'. On a type MISMATCH,
+        # reuse that row's existing fake instead of generating a fresh one -- mapping_xref's
+        # unique constraint is on originalvalue alone (not (originalvalue, type)), so a second
+        # row for the same text can never be inserted; falling through to fresh generation here
+        # would deterministically fail on the next flush (confirmed on dyncrm_contact: every
+        # batch containing 'New York'/'Singapore' failed its insert with a 23000 constraint
+        # violation before this reuse path existed).
+        non_pii_entry = self._non_pii.get(self.normalize(original))
+        if non_pii_entry:
+            row_label, row_fake = non_pii_entry
+            label = XREF_TYPE.get(ptype, '').strip().casefold()
+            if label and label == row_label:
+                self._log_outcome(original, original, 'NOT-PII-SKIPPED')
+                return original
+            self._used.add(row_fake.strip().casefold())
+            self._log_outcome(original, row_fake, 'REUSE-CROSS-TYPE')
+            return row_fake
         # SAFETY: a value already carrying a reserved forced-fake word (e.g. '…@aventraa.com')
         # is already anonymized — return it unchanged instead of re-faking (which would persist a
         # fake as an "original" and pollute mapping_xref, e.g. when re-running on anonymized data).
@@ -1553,9 +1703,11 @@ class FakeEngine:
             elif ptype == 'url': r = self._gen_url(o)
             elif ptype == 'birth': r = self._gen_birth(o)
             elif ptype == 'region': r = self._gen_region(o, country=country_hint)
+            elif ptype == 'state_province': r = self._gen_state_province(o, country=country_hint)
             else: r = {'phone': self._gen_phone,
                        'country': self._gen_country,
                        'location': self._gen_location,
+                       'street_name': self._gen_street_name,
                        'org': self._gen_org}.get(ptype, self._gen_org)(o)
             return self.apply_forced(r)    # ensure centific/pactera never survives (e.g. phone-typed text)
         xref_id, val = self.xref_lookup_with_id(canon, ptype)   # 1) reuse existing mapping
@@ -2182,7 +2334,8 @@ def run(cur, tbl, limit, restart, order_override, gl, prefer_clean=False, dry_ru
 
     enabled_map = {c['column'].lower(): c for c in enabled}
     freetext = [c for c in enabled if c.get('mode') == 'freetext']
-    if freetext: gl.load()
+    have_location_composite = any(c.get('type') == 'location_composite' for c in enabled)
+    if freetext or have_location_composite: gl.load()
 
     total = cur.execute(f"SELECT COUNT(*) FROM [{SCHEMA}].[{tbl}] WITH (NOLOCK)").fetchone()[0]
     present = cur.execute(f"SELECT COUNT(*) FROM [{SCHEMA}].[{anon}] WITH (NOLOCK)").fetchone()[0]
@@ -2273,7 +2426,8 @@ def run(cur, tbl, limit, restart, order_override, gl, prefer_clean=False, dry_ru
     # and_forced_company_map.md. `domain` gates KNOWN_BRAND_STOP in scrub_post; the company
     # forced-map is the deterministic backstop applied on top of GLiNER regardless of domain.
     domain = table_domain(base)
-    company_forced_map = load_company_forced_map() if have_freetext else {}
+    company_forced_map = (load_company_forced_map()
+                          if have_freetext or have_location_composite else {})
     company_pattern_cache = {}   # compiled once, reused across every cell (see apply_literal_map)
     for c in enabled:                          # 'region' columns: build the real region pool
         if c.get('type') == 'region' and c.get('country_column'):
@@ -2511,6 +2665,16 @@ def run(cur, tbl, limit, restart, order_override, gl, prefer_clean=False, dry_ru
             return v
         if c['mode'] == 'freetext':
             return scrub_text(str(value), gl, engine, known, domain=domain, company_map=company_forced_map)
+        if c['type'] == 'location_composite':   # see location_anonymizer.py; unbatched here
+            # (run()'s own INSERT-path batching -- ft_idx/pre_cache above -- only covers
+            # mode=='freetext' columns; location_composite columns keep mode='structured', so
+            # they're deliberately NOT folded into that 3-stage batch here, unlike
+            # run_inplace() which DOES batch them via bulk_scrub_freetext's geo_aware param.
+            # Acceptable for run()'s actual use (dry-run validation on small samples); the real
+            # execution path for every table that already has an _anonymized copy -- true
+            # project-wide -- is run_inplace(), which is batched.)
+            return scrub_text(str(value), gl, engine, known, domain=domain,
+                               company_map=company_forced_map, geo_aware=True, column=colname)
         if c['type'] == 'org_code':      # composite/coded org value -- see obi_org_microfake.py
             from obi_org_microfake import micro_org_fake
             return micro_org_fake(str(value), engine)
@@ -3153,6 +3317,25 @@ def scrub_post(text, ents, engine, protect, domain='general'):
             # the value.
             if ptype == 'phone' and not any(c.isdigit() for c in span):
                 continue
+            # geo entity types added by location_anonymizer.py's detect_geo_entities() (only
+            # ever present when the caller passed geo_aware=True -- see scrub_text()/
+            # bulk_scrub_freetext()) -- 'street_address'/'postal_code' don't go through plain
+            # engine.fake() like every other ptype here: a street address needs its own
+            # house-number/suffix-preserving sub-tokenizer, and a postal code is a deterministic
+            # digit-substitution that's intentionally never persisted to mapping_xref (same
+            # reasoning as id/url -- see location_anonymizer._digit_shuffle's docstring).
+            # 'city'/'country'/'state_province'/'street_name' need no special-casing here, they
+            # already have a normal fake() ptype dispatch.
+            if ptype == 'street_address':
+                from location_anonymizer import _split_street_address
+                out.append(text[prev:start]); out.append(_split_street_address(span, engine))
+                prev = end; last = end
+                continue
+            if ptype == 'postal_code':
+                from location_anonymizer import _digit_shuffle
+                out.append(text[prev:start]); out.append(_digit_shuffle(span))
+                prev = end; last = end
+                continue
             out.append(text[prev:start]); out.append(engine.fake(span, ptype))
             prev = end; last = end
         out.append(text[prev:])
@@ -3383,7 +3566,8 @@ def _json_safe_fallback(original, scrubbed, pre):
         return pre
     return scrubbed
 
-def scrub_text(text, gl, engine, known=None, domain='general', company_map=None):
+def scrub_text(text, gl, engine, known=None, domain='general', company_map=None,
+               geo_aware=False, column=None, country_hint_col_value=None):
     """Single-cell scrub (pre -> per-text GLiNER -> post). Used for non-batched paths.
 
     `domain`/`company_map` -- see scrub_post()/apply_literal_map() docstrings (fixes C/A/D).
@@ -3391,9 +3575,23 @@ def scrub_text(text, gl, engine, known=None, domain='general', company_map=None)
     post-scrub text to catch entities whose signal was diluted by markup in the first pass
     (fix A); its hits and the MANUAL_COMPANY_MAP backstop (fix D) are applied as literal
     substitutions, never offset splicing, so they're safe against the stripped/original text
-    not being the same string."""
+    not being the same string.
+
+    `geo_aware` -- opt-in only (default False, so every EXISTING freetext caller is completely
+    unaffected). When True, ALSO runs location_anonymizer.detect_geo_entities() on the same text
+    and merges its spans with the standard GLiNER person/org/email/phone ents (standard ents win
+    on overlap -- geo detection only fills gaps) before scrub_post() splices everything in one
+    pass. See location_anonymizer.py's module docstring for why this is folded into the SAME
+    pass rather than a separate geo-only pipeline (real address1_composite data mixes names/
+    emails/phones with the address in the same cell)."""
     pre, protect = scrub_pre(text, engine, known)
-    scrubbed = scrub_post(pre, gl.entities(pre), engine, protect, domain=domain)
+    ents = gl.entities(pre)
+    if geo_aware:
+        from location_anonymizer import detect_geo_entities, merge_entity_spans
+        geo_ents = detect_geo_entities(pre, engine, gl=gl, column=column,
+                                        country_hint_col_value=country_hint_col_value)
+        ents = merge_entity_spans(ents, geo_ents)   # standard person/org/email/phone ents win on overlap
+    scrubbed = scrub_post(pre, ents, engine, protect, domain=domain)
     scrubbed = _json_safe_fallback(text, scrubbed, pre)
     if domain != 'resume' and '<' in scrubbed:
         stripped = strip_html_for_detection(scrubbed)
@@ -3469,7 +3667,13 @@ def run_inplace(cur, tbl, anon, enabled, limit, order_override, gl, prefer_clean
             f"SELECT {order_sql} FROM [{SCHEMA}].[{anon}] ORDER BY {order_sql}").fetchall()]
         save_json(keys_snap_path, key_rows)
 
-    freetext = [c for c in enabled if c.get('mode') == 'freetext']
+    # location_composite columns are routed through the SAME freetext-batched path (they need
+    # full person/org/email/phone detection too -- see location_anonymizer.py's module
+    # docstring for why: real address1_composite data mixes signature-block PII with the
+    # address, not pure geo text) even though their plan.json `mode` stays 'structured'.
+    # geo_columns tags exactly which of these batched columns need the extra geo-detection pass.
+    freetext = [c for c in enabled if c.get('mode') == 'freetext' or c.get('type') == 'location_composite']
+    geo_columns = {c['column'] for c in enabled if c.get('type') == 'location_composite'}
     if freetext: gl.load()
     log("=" * 78)
     log(f"UPDATE-IN-PLACE {anon}  (existing table, NOT dropped)  | columns: {col_names}")
@@ -3481,8 +3685,7 @@ def run_inplace(cur, tbl, anon, enabled, limit, order_override, gl, prefer_clean
     # domain-scoped freetext hardening (fixes C/A/D) -- see run()'s equivalent setup and
     # FIX_GUIDE_freetext_domain_scope_and_forced_company_map.md.
     domain = table_domain(tbl)
-    company_forced_map = (load_company_forced_map()
-                          if any(c.get('mode') == 'freetext' for c in enabled) else {})
+    company_forced_map = load_company_forced_map() if freetext else {}
     inplace_company_pattern_cache = {}         # persists across batches -- see apply_literal_map's
                                                 # docstring for the perf incident an uncached regex caused
     for c in enabled:                          # 'region' columns: build the real region pool
@@ -3632,7 +3835,8 @@ def run_inplace(cur, tbl, anon, enabled, limit, order_override, gl, prefer_clean
             if items:
                 scrubbed = bulk_scrub_freetext(
                     [(col, txt) for _, col, txt in items], gl, engine, domain=domain,
-                    company_map=company_forced_map, pattern_cache=inplace_company_pattern_cache)
+                    company_map=company_forced_map, pattern_cache=inplace_company_pattern_cache,
+                    geo_aware=bool(geo_columns), geo_columns=geo_columns)
                 for (ri, col, _), v in zip(items, scrubbed):
                     freetext_results[(ri, col)] = v
         upd = []
@@ -3652,7 +3856,7 @@ def run_inplace(cur, tbl, anon, enabled, limit, order_override, gl, prefer_clean
                 if v is not None and c['type'] == 'amount':
                     v = jitter_amount(v)
                     engine._log_outcome(str(orig_v), v, 'GENERATED-NOT-STORED')  # amount bypasses fake()
-                elif v is not None and c['mode'] == 'freetext':
+                elif v is not None and (c['mode'] == 'freetext' or c['type'] == 'location_composite'):
                     v = freetext_results.get((ri, c['column']), v)   # pre-computed above, batched
                 elif v is not None and c['type'] == 'org_code':   # see obi_org_microfake.py
                     from obi_org_microfake import micro_org_fake
