@@ -217,4 +217,11 @@ MANUAL_COMPANY_MAP = {
     'three marketeers commuincations group inc': 'Fathom Nexus Kinetic Group Inc',  # mapping_xref id 737456
     'whitesource software': 'Pinnacle Obsidian',                          # mapping_xref id 737429
     'mention solutions sas': 'Pinnacle Solutions SWS',                    # mapping_xref id 738323
+
+    # Found on pwsdetail.QNRData/SummaryData: bare 4-letter client-code prefixes embedded in a
+    # structured sub-field ("ContractClientRole":"CTFC-GEN-105"/"MSFT-CNE-216") -- too short and
+    # context-free for GLiNER to catch reliably (same fragility as short state-code tokens
+    # elsewhere in this file), so backstopped here rather than left to detection alone.
+    'msft': 'ReedForgeEn LLC',                                            # mapping_xref id 182047 (already reused project-wide)
+    'ctfc': 'dyzn',                                            # no prior mapping_xref entry -- newly curated
 }
