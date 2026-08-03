@@ -127,6 +127,25 @@ def bulk_scrub_freetext(items, gl, engine, domain='general', company_map=None,
         col, text = items[i]
         engine.set_log_context(col)
         pre, protect = scrub_pre(str(text), engine, known)
+        if company_map:
+            # Apply the company backstop BEFORE GLiNER runs, not just after (the original,
+            # still-present call near the end of this function) -- confirmed necessary on
+            # pwsdetail.QNRData/SummaryData: a curated code like 'MSFT'/'CTFC' sitting inside a
+            # readable-ish sub-string ("STE-4-Off (MSFT-CNE)") sometimes gets swept into GLiNER's
+            # OWN 'organization' span first (whole-phrase, unstable boundaries depending on the
+            # surrounding cell's content -- confirmed reproducing only on full real cells, not a
+            # short isolated snippet), so by the time the later company_map pass runs its own
+            # literal search, the code has already been replaced by something else and there's
+            # nothing left to find. Applying here first means GLiNER sees the curated fake
+            # instead of the raw code, and _protect() below stops it from being re-faked as a
+            # "new" email/name if it happens to resemble one -- it does NOT stop GLiNER from
+            # separately mis-tagging the fake's surrounding phrase, which is a GLiNER model
+            # limitation on unfamiliar tokens, not something a string-level guard can fully
+            # close; the later pass stays in place as a harmless no-op safety net for text this
+            # early pass didn't touch.
+            pre = apply_literal_map(pre, company_map, protect, pattern_cache=pattern_cache)
+            for fake in company_map.values():
+                protect.add(fake.casefold())
         pre_list[i] = pre
         protect_list[i] = protect
         stripped_list[i] = strip_html_for_detection(pre)

@@ -1076,8 +1076,30 @@ class FakeEngine:
                     fakeraw = self._ff(tok) if role_col == 'first_name' else self._fl(tok)
                 tok_to_fake[tok_clean] = re.sub(r'[^a-z0-9]', '', fakeraw.lower()) or 'x'
             if tok_to_fake:
-                pat = re.compile('|'.join(re.escape(t) for t in sorted(tok_to_fake, key=len, reverse=True)))
-                newlocal = pat.sub(lambda m: tok_to_fake[m.group(0)], local_clean)
+                # Try a SEPARATOR-PRESERVING substitution first: if every dot/underscore/hyphen-
+                # delimited segment of the ORIGINAL local part matches a hint token exactly whole
+                # (e.g. 'raul'/'moya' in 'Raul.Moya'), replace segment-for-segment so the original
+                # 'firstname.lastname' shape survives into the fake instead of collapsing to one
+                # concatenated blob -- confirmed necessary: pwsdetail's "ResourceName" field
+                # ('Raul Moya Aceña-Raul.Moya@centific.com') was faking to
+                # 'Hemang Vrginia Gasim-hemangvrginia@aventraa.com', losing the dot even though
+                # both real tokens matched cleanly. Falls back to the pre-existing clean/
+                # concatenated substitution below for anything messier (a hint token split ACROSS
+                # separators, e.g. 'r.mary.am.d' matching 'maryam') -- unchanged from before, so
+                # that already-correct behavior keeps working exactly as documented above.
+                seg_list = re.split(r'([._\-])', local)
+                segs, seps = seg_list[0::2], seg_list[1::2]
+                segs_clean = [re.sub(r'[^a-z0-9]', '', seg.lower()) for seg in segs]
+                if segs_clean and all(not sc or sc in tok_to_fake for sc in segs_clean):
+                    pieces = []
+                    for i, sc in enumerate(segs_clean):
+                        pieces.append(tok_to_fake.get(sc, segs[i]))
+                        if i < len(seps):
+                            pieces.append(seps[i])
+                    newlocal = ''.join(pieces)
+                else:
+                    pat = re.compile('|'.join(re.escape(t) for t in sorted(tok_to_fake, key=len, reverse=True)))
+                    newlocal = pat.sub(lambda m: tok_to_fake[m.group(0)], local_clean)
             else:
                 newlocal = local_clean
         elif len(parts) >= 2:
@@ -2890,7 +2912,16 @@ def run(cur, tbl, limit, restart, order_override, gl, prefer_clean=False, dry_ru
 # DIFFERENT fake here than wherever else it was faked from a clean key (e.g. a structured email
 # column in the same row). Requiring alnum at both ends closes this without affecting any
 # legitimate email (real addresses don't start/end their local part on '.'/'_'/'%'/'+'/'-').
-_EMAIL_PLAIN = re.compile(r'(?<!\\)[A-Za-z0-9](?:[A-Za-z0-9._%+\-]*[A-Za-z0-9])?'
+# (?<![^\W_]) -- don't START a match right after a Unicode LETTER/digit (any script, not just
+# ASCII): confirmed a real name ending in a non-ASCII letter glued directly to an email by a
+# hyphen (e.g. 'Aceña-Raul.Moya@centific.com') got its own final ASCII letter swallowed into the
+# email match, since 'ñ' isn't in the local-part class above and the regex just resumed matching
+# one character later ('a-Raul.Moya@...') -- see _JSON_RESOURCENAME_RE's comment for the full
+# story. `[^\W_]` is "\w minus underscore" (a double negative: NOT(non-word OR underscore) ==
+# word-and-not-underscore), so this still ALLOWS resuming right after an underscore -- preserving
+# the back-to-back-emails fix directly above/below this comment ('...centific.com_peer.bdr@...'
+# still correctly starts its second match at 'peer', since '_' doesn't match `[^\W_]`).
+_EMAIL_PLAIN = re.compile(r'(?<!\\)(?<![^\W_])[A-Za-z0-9](?:[A-Za-z0-9._%+\-]*[A-Za-z0-9])?'
                            r'@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}')
 # URL-encoded email (@ -> %40) as found in Outlook SafeLinks / tracking URLs, e.g.
 # 'kiran.mallakunta%40centific.com'. GLiNER never tags these, so they'd leak the real
@@ -2966,6 +2997,22 @@ _DATE_YMD_RE = re.compile(r'^(\d{4})([./\-])(\d{1,2})(?:([./\-])(\d{1,2}))?$')
 # generators exactly as _JSON_BIRTH_RE reuses jitter_birthdate.
 _JSON_LOCATION_RE = re.compile(r'("location"\s*:\s*")([^"]{0,80})(")')
 _JSON_PHONE_RE = re.compile(r'("phone"\s*:\s*")([^"]{0,40})(")')
+# "<Full Name>-<email-local>@<domain>" glued with NO space around the hyphen (confirmed present
+# in real data under a "ResourceName" JSON key -- e.g. 'Raul Moya Aceña-Raul.Moya@centific.com',
+# 4,303 occurrences, always this exact key). Must run BEFORE _EMAIL_PLAIN below: that generic
+# regex's local-part class doesn't include non-ASCII letters, so on a name ending in one (e.g.
+# 'Aceña') it treats the accented letter as a boundary and resumes matching one char later,
+# swallowing the final ASCII letter of the name into the "email" it masks (confirmed: 'Aceña-
+# Raul.Moya@centific.com' -> matched span 'a-Raul.Moya@centific.com', leaving 'Raul Moya' -- the
+# real person's actual first+last name -- completely unmasked in front of it, and 'Aceñ' visibly
+# truncated). Even where there's no accented letter, hyphens are themselves a legal email
+# local-part character, so _EMAIL_PLAIN happily reads the WHOLE 'Lastname-email@domain' as one
+# local part on its own (e.g. 'Fajardo-leni.lehmann@centific.com'), again leaving the preceding
+# name ('Leni Lehmann') untouched. This key-anchored pattern (same precedent as _JSON_NAME_RE
+# above) splits name from email explicitly and fakes each with the RIGHT generator instead of
+# relying on the generic email regex to guess the boundary right.
+_JSON_RESOURCENAME_RE = re.compile(
+    r'("ResourceName"\s*:\s*")([^"]+)-([\w.+%\-]+@[\w.\-]+\.[A-Za-z]{2,})(")')
 
 def jitter_birthdate(original, seed_fn):
     """Format-preserving, semantically-bounded fake for a 'birth' value: YYYY<sep>MM or
@@ -3067,6 +3114,27 @@ def scrub_pre(text, engine, known=None, row_tokens=None):
         protect.add(fake.casefold())
         if '@' in fake:
             protect.add(fake.split('@', 1)[0].casefold())
+
+    # Must run FIRST, before _EMAIL_PLAIN below claims part of the name into its "email" match --
+    # see _JSON_RESOURCENAME_RE's own comment for why.
+    def _resourcename(m):
+        pre, name, email, post = m.group(1), m.group(2), m.group(3), m.group(4)
+        if not name.strip():
+            return m.group(0)
+        # mirrors _gen_person's own multi-word convention (first token + every middle token ->
+        # first-name-style fake, last token -> surname-style fake), so the tokens borrowed below
+        # for the email's local part are faked EXACTLY the same way the name itself just was --
+        # guarantees the split name and derived email agree (e.g. 'Raul'/'Moya' both come out as
+        # the same fakes in "Raul Moya Aceña" and in the "Raul.Moya@..." local part), and stay
+        # consistent with any other occurrence of this same person elsewhere in the table.
+        toks = name.split()
+        fn_hits = [(t, False) for t in toks[:-1]] if len(toks) > 1 else [(toks[0], False)]
+        ln_hits = [(toks[-1], False)] if len(toks) > 1 else []
+        fake_name = engine.fake(name, 'person')
+        fake_email = engine.fake(email, 'email', name_hint=(fn_hits, ln_hits))
+        _protect(fake_name); _protect(fake_email)
+        return (pre + _json_str_escape(fake_name) + '-' + _json_str_escape(fake_email) + post)
+    text = _JSON_RESOURCENAME_RE.sub(_resourcename, text)
 
     def _plain(m):
         fake = engine.fake(m.group(0), 'email'); _protect(fake); return fake
