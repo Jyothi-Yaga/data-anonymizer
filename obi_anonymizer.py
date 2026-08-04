@@ -52,7 +52,8 @@ except Exception:
     pycountry = None
 import obi_chinese_anonymizer as chinese_anon
 from constants import (RESUME_DOMAIN_TABLES, table_domain, GENERIC_ENTITY_STOP,
-                        KNOWN_BRAND_STOP, _PRONOUN_STOP, FORCED_MAP, MANUAL_COMPANY_MAP)
+                        KNOWN_BRAND_STOP, _PRONOUN_STOP, FORCED_MAP, MANUAL_COMPANY_MAP,
+                        PWSDETAIL_CODE_MAP)
 
 # Windows consoles default to cp1252 and crash printing non-ASCII (Chinese names, ₹, …).
 try:
@@ -2451,6 +2452,14 @@ def run(cur, tbl, limit, restart, order_override, gl, prefer_clean=False, dry_ru
     company_forced_map = (load_company_forced_map()
                           if have_freetext or have_location_composite else {})
     company_pattern_cache = {}   # compiled once, reused across every cell (see apply_literal_map)
+    # Table-scoped exact-match backstop -- see constants.PWSDETAIL_CODE_MAP's own comment and
+    # run_inplace()'s equivalent setup above. NOT wired into scrub_text()'s company_map param
+    # below (that path is case_adapt=True by design for MANUAL_COMPANY_MAP); applied separately
+    # via apply_literal_map(..., case_adapt=False) in the stage-3 loop instead.
+    exact_forced_map = (PWSDETAIL_CODE_MAP
+                        if (have_freetext or have_location_composite) and base == 'pwsdetail'
+                        else {})
+    exact_pattern_cache = {}
     for c in enabled:                          # 'region' columns: build the real region pool
         if c.get('type') == 'region' and c.get('country_column'):
             engine.load_region_pool(cur, SCHEMA, tbl, c['column'], c['country_column'])
@@ -2822,6 +2831,9 @@ def run(cur, tbl, limit, restart, order_override, gl, prefer_clean=False, dry_ru
                         v = apply_literal_map(v, lit_map, protect)
                     if company_forced_map:
                         v = apply_literal_map(v, company_forced_map, protect, pattern_cache=company_pattern_cache)
+                    if exact_forced_map:
+                        v = apply_literal_map(v, exact_forced_map, protect,
+                                              pattern_cache=exact_pattern_cache, case_adapt=False)
                     v = _json_safe_fallback(rows[ri][ci], v, pre)
                     pre_cache[k].append(v)   # index 3 = final scrubbed value
             out = []
@@ -3492,7 +3504,7 @@ def strip_html_for_detection(text):
 
 _LITERAL_WORD_BOUND = r'(?<![A-Za-z0-9])({})(?![A-Za-z0-9])'
 
-def apply_literal_map(text, literal_map, protect, min_len=3, pattern_cache=None):
+def apply_literal_map(text, literal_map, protect, min_len=3, pattern_cache=None, case_adapt=True):
     """Deterministic, word/phrase-boundary-aware, longest-match-first literal substitution --
     the mechanism behind BOTH the MANUAL_COMPANY_MAP backstop (fix D) and the secondary
     HTML-stripped-pass entities (fix A). Unlike scrub_post's GLiNER-offset splicing, this
@@ -3503,7 +3515,14 @@ def apply_literal_map(text, literal_map, protect, min_len=3, pattern_cache=None)
 
     `literal_map`: {lowercased original -> fake}. `protect`: casefolded fakes already inserted
     this cell (never re-fake a fake). `min_len`: skip too-short keys (avoids single-letter/very
-    common short-token noise from ever reaching this deterministic path).
+    common short-token noise from ever reaching this deterministic path). `case_adapt`: when
+    True (default, unchanged behavior for every existing caller), the fake is re-cased via
+    case_like() to match the original span's case pattern. Set False when the fake's OWN case
+    pattern is deliberate and must survive verbatim -- case_like() .capitalize()s every alpha run
+    of a Title-cased match, which corrupts an intentional acronym mix like 'C_TKH DN_Fathom' into
+    'C_Tkh Dn_Fathom' (confirmed empirically; same class of bug already fixed for street-address
+    fakes in obi_freetext_bulk.py via a separate plain-replace path -- this flag generalizes that
+    fix into apply_literal_map itself instead of duplicating the function).
 
     `pattern_cache`: optional mutable dict the CALLER keeps alive across cells (e.g. one per
     run()/scrub_text call site), used to avoid recompiling the same regex per cell. PERFORMANCE
@@ -3555,7 +3574,7 @@ def apply_literal_map(text, literal_map, protect, min_len=3, pattern_cache=None)
             return span   # never touch HTML tag names/attributes -- prose-only sweep
         if (s > 0 and text[s - 1] == '@') or (e < len(text) and text[e] == '@'):
             return span   # don't touch anything glued to '@' (email-adjacent), same as scrub_post
-        return case_like(span, literal_map[low])
+        return case_like(span, literal_map[low]) if case_adapt else literal_map[low]
 
     return pattern.sub(_sub, text)
 
@@ -3756,6 +3775,11 @@ def run_inplace(cur, tbl, anon, enabled, limit, order_override, gl, prefer_clean
     company_forced_map = load_company_forced_map() if freetext else {}
     inplace_company_pattern_cache = {}         # persists across batches -- see apply_literal_map's
                                                 # docstring for the perf incident an uncached regex caused
+    # Table-scoped exact-match backstop (2026-08-03) -- see constants.PWSDETAIL_CODE_MAP's own
+    # comment for why this is a separate, case_adapt=False dict/cache rather than merged into
+    # company_forced_map above, and why it's gated to this one table rather than applied globally.
+    exact_forced_map = PWSDETAIL_CODE_MAP if (freetext and tbl == 'pwsdetail') else {}
+    inplace_exact_pattern_cache = {}
     for c in enabled:                          # 'region' columns: build the real region pool
         if c.get('type') == 'region' and c.get('country_column'):
             # from the SOURCE table (tbl), never anon -- anon may already hold partially-faked
@@ -3904,7 +3928,8 @@ def run_inplace(cur, tbl, anon, enabled, limit, order_override, gl, prefer_clean
                 scrubbed = bulk_scrub_freetext(
                     [(col, txt) for _, col, txt in items], gl, engine, domain=domain,
                     company_map=company_forced_map, pattern_cache=inplace_company_pattern_cache,
-                    geo_aware=bool(geo_columns), geo_columns=geo_columns)
+                    geo_aware=bool(geo_columns), geo_columns=geo_columns,
+                    exact_map=exact_forced_map, exact_pattern_cache=inplace_exact_pattern_cache)
                 for (ri, col, _), v in zip(items, scrubbed):
                     freetext_results[(ri, col)] = v
         upd = []

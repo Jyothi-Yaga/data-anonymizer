@@ -225,3 +225,110 @@ MANUAL_COMPANY_MAP = {
     'msft': 'ReedForgeEn LLC',                                            # mapping_xref id 182047 (already reused project-wide)
     'ctfc': 'dyzn',                                            # no prior mapping_xref entry -- newly curated
 }
+
+# Deterministic, pwsdetail-ONLY backstop (2026-08-03) -- every value below already has an
+# established fake in mapping_xref, confirmed leaking verbatim (0% GLiNER detection) in a full,
+# untruncated scan of pwsdetail's five JSON freetext columns (ExpenseData/QNRData/RevenueData/
+# RiskData/SummaryData) against a lokes_verify-style corpus check. GLiNER (a natural-language NER
+# model) has near-zero recall on these: they're bare internal codes (ResourceCCC cost-center IDs,
+# "XX T<n>" location-tier tags, FCST_* expense category labels) with no sentence-like context, not
+# the kind of thing an NER model was trained to recognize. A handful of plain person names that
+# should have been caught by the normal path are included too (root cause for those specifically:
+# the GENERIC_ENTITY_STOP suppression rule discarding a whole GLiNER span that happens to include
+# an adjacent hyphen-glued generic word, e.g. "Student Worker-Jinsong Li" -- see the scrub_post fix
+# alongside this dict; these entries are a belt-and-suspenders backstop for THIS confirmed set,
+# not a substitute for that fix, since future new names won't be in this static list).
+#
+# IMPORTANT: apply this dict with apply_literal_map(..., case_adapt=False) — case_like() would
+# corrupt these (it title-cases every alpha run of the fake to match the original's case pattern,
+# which mangles deliberate acronym casing like 'C_TKH DN_Fathom' -> 'C_Tkh Dn_Fathom'). Confirmed
+# empirically before adding this dict: 27 of these 55 fakes get mangled by case_like.
+#
+# Table-scoped deliberately (gate on table == 'pwsdetail' at the call site), unlike
+# MANUAL_COMPANY_MAP above which applies project-wide -- these are short, generic-shaped tokens
+# ("CN T1", "US T1") with a real, if small, risk of coincidentally matching unrelated text in a
+# different table's freetext column, so the blast radius is kept to the one table they were
+# confirmed on.
+#
+# Known pre-existing data-quality quirks in mapping_xref, carried through as-is (not introduced by
+# this dict, not fixed here -- fixing them means picking a NEW fake, which is out of scope for a
+# leak-closing backstop that must reuse each original's CANONICAL fake):
+#   - 'us t1' and 'us t2' both already map to the same fake 'BROOKFIELD-ASHFORD' upstream in
+#     mapping_xref -- the T1/T2 distinction is lost in the anonymized data. Pre-existing collision,
+#     not created here.
+#   - 'multimodal if preference data & rewrite' (a task/project name, not a person) already has a
+#     garbled multi-word fake -- looks like an earlier GLiNER pass misread it as a compound name.
+#     Reused as-is rather than re-curated, since the goal here is closing the leak, not auditing
+#     mapping_xref's history.
+PWSDETAIL_CODE_MAP = {
+    # location-tier codes (ResourceLocation-adjacent, QNRData/SummaryData) -- by far the largest
+    # share of the leak: these 5 alone were 18,462 of the 20,507 total leaked occurrences found.
+    'cn t1': 'GREENVILLE-WESTBROOK',
+    'cn t2': 'LAKEWOOD-FAIRVIEW',
+    'in t1': 'CEDARVILLE-ELMWOOD',
+    'us t1': 'BROOKFIELD-ASHFORD',
+    'us t2': 'BROOKFIELD-ASHFORD',           # see note above: shares a fake with 'us t1' upstream
+
+    # ResourceCCC cost-center / delivery-unit codes (QNRData/RevenueData)
+    'c_edge_del cn_digital_expedia': 'O_HHVP_OCY UG_Fathom_Evercrest',
+    'c_gdc cn_eng_emergingsh': 'K_SSJ BG_HMK_Indigo',
+    'c_gdc cn_eng_isv': 'R_GRH HY_TEI_SOQ',
+    'c_gdc cn_eng_ms': 'U_LEC HA_MJL_RY',
+    'c_gdc cn_llmagenticai_ups': 'U_HLL UW_Cypress_QIH',
+    'c_gdc cn_llmcoreai_ms': 'K_FLK PF_Radian_BD',
+    'c_gdc cn_llmdata_dmc': 'F_XQI NT_Helios_SNI',
+    'c_gdc eu_llmdata': 'R_MMX UL_Radian',
+    'c_gdc eu_llmdata_amazon': 'D_CDP GA_Indigo_Helios',
+    'c_gdc eu_llmhealthcare': 'C_TKH DN_Fathom',
+    'c_gdc idc_eng_ms': 'R_KDR WHQ_NIN_VG',
+    'c_gdc idc_llmcoreai': 'D_HJB QGV_Cascade',
+    'c_gdc idc_llmhealthcare': 'C_GIV NTR_Monarch',
+    'c_gdc idc_llmloc': 'R_ZQP EKH_Novena',
+    'c_gdc sea_eng_ms': 'Z_GYO HFJ_NYZ_DY',
+    'c_gdc sea_llmdata': 'Z_RAD GIF_Pinnacle',
+    'c_gdc sea_llmdata_amazon': 'K_FRP NL_Solstice_Falconix',
+    'c_gdc sea_llmdata_new': 'V_OWS JLH_Aperture_Blueridge',
+    'c_gdc sea_llmloc_isaac': 'H_BLP QHJ_Polaris_Nimbus',
+    'c_gdc sea_mlai': 'U_CCL KUZ_IVKB',
+    'c_llm_data_us amazon': 'Q_CJA_Sapphire_MO Equinox',
+    'c_llm_loc_us isaac': 'Y_NEX_Radian_DM CEDARPOINT',
+    'gdc us_bu': 'NGJ CQ_KV',
+    'llm_data_us amazon': 'KOC_Arcadia_SZ Emberline',
+
+    # expense/task category labels (ExpenseData/RevenueData)
+    'fcst exp_entertainment': 'DTXZ Monarch_Emberline',
+    'fcst exp_others': 'XBPV Fathom_Kinetic',
+    'fcst exp_travel expenses': 'GSYB Harborview_Vanguard Tessera',
+    'translation pilot': 'Fathom Cirrus',
+    'translation service': 'MapleReachO Group',
+    'utterance generation': 'Titan xenon',
+    'technical support': 'Cypress obsidian',
+    'learning & development': 'Fathom & Solstice',
+    'multimodal if preference data & rewrite': 'Saber MARIAMA Carymyrat Tsepho Fafo Dwaine',
+
+    # apparent NER mistakes upstream in mapping_xref (public product name / generic org phrase
+    # mapped to a person-shaped fake) -- reused as-is rather than re-curated, same rationale as
+    # the note above.
+    'azure devops': 'Brooke Harrison',
+    'cypress automation': 'Kestrel Radian Sapphire',
+
+    # genuine person names confirmed leaking raw in QNRData/ExpenseData/RevenueData -- missed by
+    # the normal GLiNER + GENERIC_ENTITY_STOP path (see the scrub_post fix alongside this dict for
+    # the "Student Worker-Name"/"C2C-Name" root cause). Backstopped here for the confirmed set;
+    # the scrub_post fix is what should catch any NOT yet observed.
+    'charles cooper': 'Cynthia Kouhia',
+    'james smith': 'Russell Wright',
+    'jie sheng': 'Xin Lin',
+    'jing xiao': 'Anna Robinson',
+    'jinsong li': 'Hannah Walker',
+    'lei wang': 'Ava Torres',
+    'lin gao': 'Carrie Chavez',
+    'md abu sayed': 'Tony Payne',
+    'meghna (idc)': 'Mouhedin (EZY)',
+    'meghna travel': 'Vanguard Everline Blueridge',
+    'qian wu': 'Wei Wang',
+    'rong zhang': 'Genesis Garcia',
+    'xinglei zong': 'Zoe Brown',
+    'yabetse (us)': 'Luisianis (IN)',
+    'ying he': 'Addison Garcia',
+}

@@ -11,7 +11,8 @@ import obi_anonymizer as m   # noqa: E402
 
 def _fe():
     fe = m.FakeEngine.__new__(m.FakeEngine)
-    fe._used = set(); fe._cache = {}
+    fe._used = set(); fe._cache = {}; fe._non_pii = {}
+    fe._vlog = None; fe._current_col = None
     return fe
 
 
