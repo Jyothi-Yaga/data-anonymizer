@@ -97,7 +97,8 @@ def _geo_fake_for_span(span, ptype, engine):
 
 
 def bulk_scrub_freetext(items, gl, engine, domain='general', company_map=None,
-                         known=None, pattern_cache=None, geo_aware=False, geo_columns=None):
+                         known=None, pattern_cache=None, geo_aware=False, geo_columns=None,
+                         exact_map=None, exact_pattern_cache=None):
     """items: list of (col_name, text_or_None) tuples -- typically every free-text
     cell across one row-batch (any number of distinct columns; this function doesn't
     care which row/column a cell belongs to beyond needing the column name for
@@ -109,6 +110,16 @@ def bulk_scrub_freetext(items, gl, engine, domain='general', company_map=None,
     `pattern_cache`: pass a dict the CALLER keeps alive across calls (e.g. one per
     run_inplace() invocation) so the company_map regex compiles once, not per batch --
     see apply_literal_map's docstring for the performance incident this avoids.
+
+    `exact_map`/`exact_pattern_cache`: same backstop mechanism as `company_map`/
+    `pattern_cache`, applied at the same two points (before GLiNER, and again after as a
+    safety net -- see the `company_map` comment below for why both matter), but via
+    apply_literal_map(..., case_adapt=False) so the fake is inserted verbatim instead of
+    being re-cased to match the original span. Use this for entries whose fake has its own
+    deliberate case pattern that case_like() would corrupt (e.g. constants.PWSDETAIL_CODE_MAP's
+    'C_TKH DN_Fathom'-style codes) -- kept as a SEPARATE dict/cache from company_map rather than
+    a flag on it, so callers that don't need case_adapt=False (i.e. everyone using
+    MANUAL_COMPANY_MAP) are completely unaffected.
 
     `geo_aware`/`geo_columns` -- opt-in only (default False/None, so every EXISTING freetext
     caller is completely unaffected). When True, cells whose column name is in `geo_columns`
@@ -145,6 +156,11 @@ def bulk_scrub_freetext(items, gl, engine, domain='general', company_map=None,
             # early pass didn't touch.
             pre = apply_literal_map(pre, company_map, protect, pattern_cache=pattern_cache)
             for fake in company_map.values():
+                protect.add(fake.casefold())
+        if exact_map:
+            pre = apply_literal_map(pre, exact_map, protect, pattern_cache=exact_pattern_cache,
+                                     case_adapt=False)
+            for fake in exact_map.values():
                 protect.add(fake.casefold())
         pre_list[i] = pre
         protect_list[i] = protect
@@ -197,6 +213,9 @@ def bulk_scrub_freetext(items, gl, engine, domain='general', company_map=None,
         v = engine.apply_forced(v)
         if company_map:
             v = apply_literal_map(v, company_map, protect_list[i], pattern_cache=pattern_cache)
+        if exact_map:
+            v = apply_literal_map(v, exact_map, protect_list[i],
+                                   pattern_cache=exact_pattern_cache, case_adapt=False)
         v = _json_safe_fallback(str(text), v, pre_list[i])
         out[i] = v
     return out
