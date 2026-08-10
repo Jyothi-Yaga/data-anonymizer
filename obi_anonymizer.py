@@ -3,11 +3,12 @@
 obi_anonymizer.py — from-scratch, single-table, interactive-plan anonymizer for obi.*
 =====================================================================================
 Built fresh (does NOT reuse _canonical_map or any of the earlier 18-table helper
-tables). It only *references* the anonymization LOGIC proven on obi.outlook_email:
+tables). It only *references* the anonymization LOGIC proven on o2c.outlook_email
+(schema renamed from obi 2026-08-05; obip1 unaffected):
 GLiNER PII detection + deterministic, ethnicity/gender-aware, injective fake
 generation.
 
-MAPPING SOURCE OF TRUTH (read-only): obi.mapping_xref
+MAPPING SOURCE OF TRUTH (read-only): o2c.mapping_xref
     (id, description[type], originalvalue, anonymizedvalue, comment)
     description ∈ {Names, Email, CompanyName, Name}
   * If an original already has a mapping there -> that fake is reused (consistency).
@@ -53,7 +54,8 @@ except Exception:
 import obi_chinese_anonymizer as chinese_anon
 from constants import (RESUME_DOMAIN_TABLES, table_domain, GENERIC_ENTITY_STOP,
                         KNOWN_BRAND_STOP, _PRONOUN_STOP, FORCED_MAP, MANUAL_COMPANY_MAP,
-                        PWSDETAIL_CODE_MAP)
+                        MANUAL_LOCATION_MAP, PWSDETAIL_CODE_MAP, DYNCRM_OPPORTUNITY_CODE_MAP,
+                        CRM_ITTICKET_CODE_MAP)
 
 # Windows consoles default to cp1252 and crash printing non-ASCII (Chinese names, ₹, …).
 try:
@@ -95,31 +97,32 @@ _load_dotenv()
 # DATA connection — the tables being anonymized (e.g. local SQL Server holding the slice).
 CS = os.environ.get('OBI_ANON_CS') or (
       'DRIVER={ODBC Driver 18 for SQL Server};'
-      'SERVER=obi-poc-server.database.windows.net;DATABASE=obi-sql-db;'
+      'SERVER=obi-poc-server.database.windows.net;DATABASE=o2c-sql-db;'
       'UID=obi_admin;PWD=__SET_VIA_ENV__;Encrypt=yes;TrustServerCertificate=no;')
-# MAPPING connection — the SHARED single source of truth `obi.mapping_slice` on Azure obi-sql-db.
+# MAPPING connection — the SHARED single source of truth `o2c.mapping_slice` on Azure o2c-sql-db
+# (renamed 2026-08-05 from o2c-sql-db/obi; obip1 was NOT renamed and stays as-is).
 # Data may be local while the mapping is remote/shared; override with OBI_MAP_CS if needed.
 MAP_CS = os.environ.get('OBI_MAP_CS') or (
       'DRIVER={ODBC Driver 18 for SQL Server};'
-      'SERVER=obi-poc-server.database.windows.net;DATABASE=obi-sql-db;'
+      'SERVER=obi-poc-server.database.windows.net;DATABASE=o2c-sql-db;'
       'UID=obi_admin;PWD=__SET_VIA_ENV__;Encrypt=yes;TrustServerCertificate=no;')
-SCHEMA = 'obi'                                # DATA schema -- overridable via --schema (e.g. obip1)
-MAP_SCHEMA = 'obi'                            # MAPPING table's schema -- always 'obi', never overridden;
+SCHEMA = 'o2c'                                # DATA schema -- overridable via --schema (e.g. obip1)
+MAP_SCHEMA = 'o2c'                            # MAPPING table's schema -- always 'o2c', never overridden;
                                                # the shared mapping_xref/mapping_slice table lives here
                                                # regardless of which schema the data being anonymized is in.
-XREF   = 'mapping_slice'                      # shared mapping source of truth (Azure obi-sql-db)
+XREF   = 'mapping_slice'                      # shared mapping source of truth (Azure o2c-sql-db)
 
 STATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '_state')
 
 # Import-time resolutions kept as ultimate fallbacks for _apply_version (so we do not
-# repeat the credential literal a third time; MAP_CS default already points at obi-sql-db).
+# repeat the credential literal a third time; MAP_CS default already points at o2c-sql-db).
 _DATA_CS_DEFAULT = CS
 _MAP_CS_DEFAULT  = MAP_CS
 
 # ── logic version ────────────────────────────────────────────────────────────────
 # VERSION 1 (default, present behaviour): DATA = OBI_ANON_CS (a migrated slice),
-#   MAPPING = obi.mapping_slice (shared Azure obi-sql-db). Untouched.
-# VERSION 2 (new): DATA = obi-sql-db tables directly, MAPPING = obi.mapping_xref,
+#   MAPPING = o2c.mapping_slice (shared Azure o2c-sql-db). Untouched.
+# VERSION 2 (new): DATA = o2c-sql-db tables directly, MAPPING = o2c.mapping_xref,
 #   its own _state_v2 dir (so same-named tables' plans/checkpoints never collide with v1),
 #   and run() auto-updates an already-existing <table>_anonymized IN PLACE (only the
 #   enabled columns) instead of rebuilding it.
@@ -506,7 +509,7 @@ class FakeEngine:
         self._vlog = None                     # log file handle (opened by open_value_log)
         self._current_col = None              # column name of the cell currently being anonymized
         self._last_id_state = None            # last outcome tag (REUSE:<id>/NEW:pending/NEW:DRY-RUN/GENERATED-NOT-STORED)
-        # Shared map (obi.mapping_slice on Azure) = the real target. To survive long idle periods
+        # Shared map (o2c.mapping_slice on Azure) = the real target. To survive long idle periods
         # during slow GLiNER batches (Azure closes idle connections -> 08S01), we do NOT hold a
         # persistent Azure connection: flush_pending opens a FRESH short-lived one each time.
         # Dry-run writes to a LOCAL temp table -> use the (stable) local data connection directly.
@@ -583,7 +586,7 @@ class FakeEngine:
         return int(hashlib.sha256(s.encode('utf-8', errors='replace')).hexdigest(), 16)
 
     def _load_xref(self):
-        """Preload the whole shared mapping (obi.mapping_slice) once from the MAPPING connection:
+        """Preload the whole shared mapping (o2c.mapping_slice) once from the MAPPING connection:
         build the lookup dicts and seed the injectivity ledger. Avoids per-value round-trips.
         Also records the row id per normalized-original so per-cell logs can report REUSE:<id>.
 
@@ -1965,7 +1968,7 @@ def connect():
     return cn
 
 def connect_map():
-    """Connection to the SHARED mapping store (obi.mapping_slice). Separate from the data
+    """Connection to the SHARED mapping store (o2c.mapping_slice). Separate from the data
     connection so data can be local while the mapping is the remote shared source of truth.
     SHORT timeout so a network blip fails fast (flush_pending then retries/continues) instead
     of hanging on a dead socket."""
@@ -2387,7 +2390,7 @@ def run(cur, tbl, limit, restart, order_override, gl, prefer_clean=False, dry_ru
         ckpt_file = load_json(cp)                   # None if this tool never ran here
         # v2: if the target already exists WITH ROWS, anonymize ONLY the enabled columns
         # IN PLACE on it (UPDATE, keyed on PK/unique id) — never rebuild/drop. This is the
-        # incremental column-level anonymization requested for obi-sql-db tables that already
+        # incremental column-level anonymization requested for o2c-sql-db tables that already
         # carry an anonymized copy from earlier work. (--restart forces a fresh rebuild instead.)
         if VERSION == 2 and not restart and present > 0:
             log(f"  [v2] {anon} already exists with {present:,} row(s) -> UPDATE-IN-PLACE on "
@@ -2456,9 +2459,14 @@ def run(cur, tbl, limit, restart, order_override, gl, prefer_clean=False, dry_ru
     # run_inplace()'s equivalent setup above. NOT wired into scrub_text()'s company_map param
     # below (that path is case_adapt=True by design for MANUAL_COMPANY_MAP); applied separately
     # via apply_literal_map(..., case_adapt=False) in the stage-3 loop instead.
-    exact_forced_map = (PWSDETAIL_CODE_MAP
-                        if (have_freetext or have_location_composite) and base == 'pwsdetail'
-                        else {})
+    exact_forced_map = {}
+    if have_freetext or have_location_composite:
+        if base == 'pwsdetail':
+            exact_forced_map = PWSDETAIL_CODE_MAP
+        elif base == 'dyncrm_opportunity':
+            exact_forced_map = DYNCRM_OPPORTUNITY_CODE_MAP
+        elif base == 'crm_itticket':
+            exact_forced_map = CRM_ITTICKET_CODE_MAP
     exact_pattern_cache = {}
     for c in enabled:                          # 'region' columns: build the real region pool
         if c.get('type') == 'region' and c.get('country_column'):
@@ -3603,7 +3611,13 @@ def load_company_forced_map():
     if _company_forced_map_cache is not None:
         return _company_forced_map_cache
     m = {k.strip().lower(): v for k, v in MANUAL_COMPANY_MAP.items() if k.strip()}
-    log(f"  company forced-map: {len(m):,} manually-curated entries (MANUAL_COMPANY_MAP)")
+    # MANUAL_LOCATION_MAP merged in here rather than threaded as a separate parameter --
+    # mechanically identical (word-boundary apply_literal_map, case_adapt=True, applied
+    # before+after GLiNER) so there is no reason to duplicate the wiring; kept as its own
+    # source dict purely for readability (a place is not a company).
+    m.update({k.strip().lower(): v for k, v in MANUAL_LOCATION_MAP.items() if k.strip()})
+    log(f"  company forced-map: {len(m):,} manually-curated entries "
+        f"(MANUAL_COMPANY_MAP + MANUAL_LOCATION_MAP)")
     _company_forced_map_cache = m
     return m
 
@@ -3775,10 +3789,18 @@ def run_inplace(cur, tbl, anon, enabled, limit, order_override, gl, prefer_clean
     company_forced_map = load_company_forced_map() if freetext else {}
     inplace_company_pattern_cache = {}         # persists across batches -- see apply_literal_map's
                                                 # docstring for the perf incident an uncached regex caused
-    # Table-scoped exact-match backstop (2026-08-03) -- see constants.PWSDETAIL_CODE_MAP's own
-    # comment for why this is a separate, case_adapt=False dict/cache rather than merged into
-    # company_forced_map above, and why it's gated to this one table rather than applied globally.
-    exact_forced_map = PWSDETAIL_CODE_MAP if (freetext and tbl == 'pwsdetail') else {}
+    # Table-scoped exact-match backstop (2026-08-03, extended 2026-08-04) -- see
+    # constants.PWSDETAIL_CODE_MAP's own comment for why this is a separate, case_adapt=False
+    # dict/cache rather than merged into company_forced_map above, and why it's gated to one
+    # table at a time rather than applied globally.
+    exact_forced_map = {}
+    if freetext:
+        if tbl == 'pwsdetail':
+            exact_forced_map = PWSDETAIL_CODE_MAP
+        elif tbl == 'dyncrm_opportunity':
+            exact_forced_map = DYNCRM_OPPORTUNITY_CODE_MAP
+        elif tbl == 'crm_itticket':
+            exact_forced_map = CRM_ITTICKET_CODE_MAP
     inplace_exact_pattern_cache = {}
     for c in enabled:                          # 'region' columns: build the real region pool
         if c.get('type') == 'region' and c.get('country_column'):
@@ -4079,13 +4101,13 @@ def main():
     ap.add_argument('--version', type=int, choices=[1, 2],
                     default=int(os.environ.get('OBI_VERSION', '1')),
                     help="logic version: 1=slice + mapping_slice (default, present behaviour); "
-                         "2=obi-sql-db + mapping_xref, UPDATE-IN-PLACE if <table>_anonymized already "
+                         "2=o2c-sql-db + mapping_xref, UPDATE-IN-PLACE if <table>_anonymized already "
                          "exists. Credentials per phase come from anonymizer/.env "
                          "(V1_DATA_CS/V1_MAP_CS, V2_DATA_CS/V2_MAP_CS).")
     ap.add_argument('--schema', default=None,
-                    help="override the DATA schema (default 'obi'), e.g. --schema obip1 for the "
+                    help="override the DATA schema (default 'o2c'), e.g. --schema obip1 for the "
                          "obip1.* table batch. The shared mapping table is NEVER affected by this -- "
-                         "it always stays in MAP_SCHEMA='obi' regardless.")
+                         "it always stays in MAP_SCHEMA='o2c' regardless.")
     ap.add_argument('--limit', default='100', help="rows this run: N | all | complete")
     ap.add_argument('--sample-rows', type=int, default=SAMPLE_ROWS_DEFAULT, help="analyze sample size")
     ap.add_argument('--order-col', default=None, help="override the resume/order key column")

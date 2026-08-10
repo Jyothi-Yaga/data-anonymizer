@@ -91,7 +91,7 @@ def _load_gazetteer(engine):
     gaz = {}
     try:
         rows = engine.cur.execute(
-            "SELECT description, originalvalue FROM obi.mapping_xref "
+            "SELECT description, originalvalue FROM o2c.mapping_xref "
             "WHERE description IN ('location','Country','country','Region','Address') "
             "AND (is_pii IS NULL OR is_pii <> 'N')").fetchall()
     except Exception:

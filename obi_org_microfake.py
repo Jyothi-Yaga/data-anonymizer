@@ -75,7 +75,7 @@ def _load_known_codes(engine):
     # type is meant for, since mapping_xref itself is a v2-only table).
     cur = engine.cur
     rows = cur.execute(
-        "SELECT originalvalue, anonymizedvalue FROM obi.mapping_xref "
+        "SELECT originalvalue, anonymizedvalue FROM o2c.mapping_xref "
         "WHERE originalvalue COLLATE Latin1_General_CS_AS = UPPER(originalvalue) COLLATE Latin1_General_CS_AS "
         "AND originalvalue NOT LIKE '%[^A-Za-z]%' AND LEN(originalvalue) BETWEEN 4 AND 8 "
         "AND description NOT IN ('Country', 'location', 'Region')").fetchall()
